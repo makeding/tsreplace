@@ -64,6 +64,15 @@ static int64_t diffTimestampTsAMinusB(int64_t a, int64_t b) {
 
 static_assert(TIMESTAMP_INVALID_VALUE == AV_NOPTS_VALUE);
 
+static const TCHAR *removeTypeDModeToStr(TSRRemoveTypeDMode mode) {
+    switch (mode) {
+    case TSRRemoveTypeDMode::Disabled: return _T("off");
+    case TSRRemoveTypeDMode::All:      return _T("all");
+    case TSRRemoveTypeDMode::Smart:    return _T("smart");
+    default:                           return _T("unknown");
+    }
+}
+
 static int funcReadPacket(void *opaque, uint8_t *buf, int buf_size) {
     TSReplaceVideo *reader = reinterpret_cast<TSReplaceVideo *>(opaque);
     return reader->readPacket(buf, buf_size);
@@ -163,7 +172,7 @@ TSRReplaceParams::TSRReplaceParams() :
     eofCutDelayMs(100),
     addAud(true),
     addHeaders(true),
-    removeTypeD(false),
+    removeTypeDMode(TSRRemoveTypeDMode::Disabled),
     removeNonTargetService(true),
     selectService(0),
     copyFileTs(false) {
@@ -997,15 +1006,19 @@ TSReplace::TSReplace() :
     m_vidFirstTimestamp(TIMESTAMP_INVALID_VALUE),
     m_vidFirstPacketPTS(TIMESTAMP_INVALID_VALUE),
     m_lastPat(),
-    m_lastPmt(),
+    m_lastPmts(),
     m_videoReplace(),
     m_patCounter(0),
-    m_pmtCounter(0),
+    m_pmtCounters(),
     m_vidCounter(0),
     m_ptswrapOffset(0),
     m_addAud(true),
     m_addHeaders(true),
-    m_removeTypeD(false),
+    m_removeTypeDMode(TSRRemoveTypeDMode::Disabled),
+    m_trimOnly(false),
+    m_inputDuration(TIMESTAMP_INVALID_VALUE),
+    m_removedTypeDPackets(0),
+    m_typeDStatsLogged(false),
     m_removeNonTargetService(true),
     m_selectService(0),
     m_copyFileTs(false),
@@ -1030,6 +1043,12 @@ TSReplace::~TSReplace() {
 RGY_ERR TSReplace::close() {
     auto sts = RGY_ERR_NONE;
     m_inputAbort = true;
+    if (!m_typeDStatsLogged && m_removeTypeDMode != TSRRemoveTypeDMode::Disabled) {
+        AddMessage(RGY_LOG_INFO, _T("Removed Type-D packets: %llu (%llu bytes).\n"),
+            (unsigned long long)m_removedTypeDPackets,
+            (unsigned long long)(m_removedTypeDPackets * 188));
+        m_typeDStatsLogged = true;
+    }
     //エンコーダの終了
     if (m_encoder) {
         AddMessage(RGY_LOG_DEBUG, _T("Close Encoder stdin.\n"));
@@ -1084,6 +1103,87 @@ RGY_ERR TSReplace::close() {
     return sts;
 }
 
+RGY_ERR TSReplace::probeInputDuration() {
+    if (_tcscmp(m_fileTS.c_str(), _T("-")) == 0) {
+        AddMessage(RGY_LOG_ERROR, _T("--smart-remove-typed requires a seekable input file; stdin is not supported.\n"));
+        return RGY_ERR_UNSUPPORTED;
+    }
+
+    std::string filename;
+    if (0 == tchar_to_string(m_fileTS.c_str(), filename, CP_UTF8)) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to convert input filename to UTF-8.\n"));
+        return RGY_ERR_UNSUPPORTED;
+    }
+
+    AVFormatContext *formatCtx = nullptr;
+    int ret = avformat_open_input(&formatCtx, filename.c_str(), nullptr, nullptr);
+    if (ret < 0) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to probe input duration: %s\n"), qsv_av_err2str(ret).c_str());
+        return RGY_ERR_FILE_OPEN;
+    }
+
+    ret = avformat_find_stream_info(formatCtx, nullptr);
+    if (ret < 0) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to read input stream information: %s\n"), qsv_av_err2str(ret).c_str());
+        avformat_close_input(&formatCtx);
+        return RGY_ERR_INVALID_FORMAT;
+    }
+
+    int64_t duration = formatCtx->duration;
+    if (duration == AV_NOPTS_VALUE || duration <= 0) {
+        duration = 0;
+        for (unsigned int i = 0; i < formatCtx->nb_streams; i++) {
+            const auto stream = formatCtx->streams[i];
+            if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0) {
+                duration = std::max(duration, av_rescale_q(stream->duration, stream->time_base, AV_TIME_BASE_Q));
+            }
+        }
+    }
+    avformat_close_input(&formatCtx);
+
+    if (duration <= 0) {
+        AddMessage(RGY_LOG_ERROR, _T("--smart-remove-typed could not determine the input duration.\n"));
+        return RGY_ERR_INVALID_FORMAT;
+    }
+
+    m_inputDuration = av_rescale(duration, TS_TIMEBASE, AV_TIME_BASE);
+    const double durationSec = m_inputDuration / (double)TS_TIMEBASE;
+    const double middleSec = durationSec * 0.5;
+    AddMessage(RGY_LOG_INFO, _T("Input duration: %.3f sec.\n"), durationSec);
+    AddMessage(RGY_LOG_INFO,
+        _T("Smart Type-D keep windows: [0.000, %.3f], [%.3f, %.3f], [%.3f, %.3f] sec.\n"),
+        std::min(60.0, durationSec),
+        std::max(0.0, middleSec - 30.0), std::min(durationSec, middleSec + 30.0),
+        std::max(0.0, durationSec - 60.0), durationSec);
+    return RGY_ERR_NONE;
+}
+
+bool TSReplace::shouldRemoveTypeD(int64_t timestamp) const {
+    if (m_removeTypeDMode == TSRRemoveTypeDMode::Disabled) {
+        return false;
+    }
+    if (m_removeTypeDMode == TSRRemoveTypeDMode::All) {
+        return true;
+    }
+    if (timestamp == TIMESTAMP_INVALID_VALUE || m_vidFirstPacketPTS == TIMESTAMP_INVALID_VALUE || m_inputDuration <= 0) {
+        return false;
+    }
+
+    const int64_t elapsed = diffTimestampTsAMinusB(timestamp, m_vidFirstPacketPTS);
+    if (elapsed < 0) {
+        return false;
+    }
+
+    const int64_t minute = 60LL * TS_TIMEBASE;
+    const int64_t halfMinute = 30LL * TS_TIMEBASE;
+    const int64_t middle = m_inputDuration / 2;
+    const bool keepStart = elapsed <= std::min(minute, m_inputDuration);
+    const bool keepMiddle = elapsed >= std::max<int64_t>(0, middle - halfMinute)
+        && elapsed <= std::min(m_inputDuration, middle + halfMinute);
+    const bool keepEnd = elapsed >= std::max<int64_t>(0, m_inputDuration - minute);
+    return !(keepStart || keepMiddle || keepEnd);
+}
+
 RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prms) {
     m_log = log;
     m_fileTS = prms.input;
@@ -1093,9 +1193,10 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_replaceDelay = prms.replaceDelay;
     m_addAud = prms.addAud;
     m_addHeaders = prms.addHeaders;
-    m_removeTypeD = prms.removeTypeD;
+    m_removeTypeDMode = prms.removeTypeDMode;
+    m_trimOnly = prms.replacefile.empty() && prms.encoderPath.empty();
     m_selectService = prms.selectService;
-    m_removeNonTargetService = prms.removeNonTargetService;
+    m_removeNonTargetService = m_trimOnly ? false : prms.removeNonTargetService;
     m_copyFileTs = prms.copyFileTs;
 
     // 置換映像EOF終了関連
@@ -1106,7 +1207,9 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
 
     AddMessage(RGY_LOG_INFO, _T("Output  file: \"%s\".\n"), prms.output.c_str());
     AddMessage(RGY_LOG_INFO, _T("Input   file: \"%s\".\n"), prms.input.c_str());
-    if (prms.replacefile.length() > 0) {
+    if (m_trimOnly) {
+        AddMessage(RGY_LOG_INFO, _T("Operation    : Type-D trim only.\n"));
+    } else if (prms.replacefile.length() > 0) {
         AddMessage(RGY_LOG_INFO, _T("Replace file: \"%s\"%s.\n"), prms.replacefile.c_str(), (prms.replacefileformat.length() > 0) ? strsprintf(_T(" (%s)"), prms.replacefileformat.c_str()).c_str() : _T(""));
     } else {
         AddMessage(RGY_LOG_INFO, _T("Encoder     : \"%s\"\n"), prms.encoderPath.c_str());
@@ -1122,7 +1225,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
         m_endAtReplaceEOF ? _T("on") : _T("off"), m_eofCutDelayMs);
     AddMessage(RGY_LOG_INFO, _T("Add AUD     : %s.\n"), m_addAud ? _T("on") : _T("off"));
     AddMessage(RGY_LOG_INFO, _T("Add Headers : %s.\n"), m_addHeaders ? _T("on") : _T("off"));
-    AddMessage(RGY_LOG_INFO, _T("Remove TypeD: %s.\n"), m_removeTypeD ? _T("on") : _T("off"));
+    AddMessage(RGY_LOG_INFO, _T("Remove TypeD: %s.\n"), removeTypeDModeToStr(m_removeTypeDMode));
     if (m_selectService) {
         if (m_selectService < 0) {
             AddMessage(RGY_LOG_INFO, _T("Target Service         : %s.\n"), serviceNum[-1 * m_selectService]);
@@ -1132,6 +1235,12 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     }
     AddMessage(RGY_LOG_INFO, _T("Preserve Other Services: %s.\n"), m_removeNonTargetService ? _T("off") : _T("on"));
     AddMessage(RGY_LOG_INFO, _T("Copy File Timestamp: %s.\n"), m_copyFileTs ? _T("on") : _T("off"));
+
+    if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart) {
+        if (auto sts = probeInputDuration(); sts != RGY_ERR_NONE) {
+            return sts;
+        }
+    }
 
     if (_tcscmp(m_fileTS.c_str(), _T("-")) != 0) {
         AddMessage(RGY_LOG_DEBUG, _T("Open input file \"%s\".\n"), m_fileTS.c_str());
@@ -1183,7 +1292,10 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_demuxer->init(log, m_selectService);
 
     m_replaceFileFormat = prms.replacefileformat;
-    if (prms.replacefile.length() > 0) {
+    if (m_trimOnly) {
+        m_encoderPath.clear();
+        m_encoderArgs.clear();
+    } else if (prms.replacefile.length() > 0) {
         m_videoReplace = std::make_unique<TSReplaceVideo>(log);
         if (auto sts = m_videoReplace->initAVReader(prms.replacefile, nullptr, prms.replacefileformat, 0); sts != RGY_ERR_NONE) {
             return sts;
@@ -1415,10 +1527,10 @@ RGY_ERR TSReplace::writeReplacedPAT(const RGYTS_PAT *pat) {
     return RGY_ERR_NONE;
 }
 
-RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
+RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, bool removeTypeD, bool replaceVideo) {
     // 参考: https://txqz.net/memo/2012-0916-1729.html
     const auto psi = result.psi.get();
-    if (psi->section_length < 9) {
+    if (psi == nullptr || psi->section_length < 9 || psi->data_count < 3 + psi->section_length) {
         return RGY_ERR_INVALID_BINARY;
     }
     const uint8_t *const table = psi->data;
@@ -1433,10 +1545,12 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
     // Create PMT
     std::vector<uint8_t> buf(1, 0);
     buf.insert(buf.end(), table + 0, table + pos); // descriptor まで
+    bool modified = false;
     // PCRが映像のストリームに含まれる場合は、別PIDで独立したPCRパケットを生成するためPCRのPIDを書き換える
-    if (m_pcrPIDReplace > 0) {
+    if (replaceVideo && m_pcrPIDReplace > 0) {
         buf[1+ 8] = (uint8_t)((m_pcrPIDReplace & 0x1fff) >> 8) | (buf[1 + 8] & 0xE0); // PIDの上書き
         buf[1+ 9] = (uint8_t) (m_pcrPIDReplace & 0x00ff);                             // PIDの上書き
+        modified = true;
     }
 
     const int tableLen = 3 + psi->section_length - 4/*CRC32*/;
@@ -1445,7 +1559,7 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
         const int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
         const int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
         
-        if (streamType == RGYTSStreamType::H262_VIDEO) {
+        if (replaceVideo && streamType == RGYTSStreamType::H262_VIDEO) {
             buf.push_back((uint8_t)m_videoReplace->getVideoStreamType());     // stream typeの上書き
             buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
             buf.push_back((uint8_t) (m_vidPIDReplace & 0x00ff));                                 // PIDの上書き
@@ -1454,8 +1568,10 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
             buf.push_back((uint8_t)RGYTSDescriptor::StreamIdentifier);
             buf.push_back(0x01);
             buf.push_back(0x00);
-        } else if (m_removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
+            modified = true;
+        } else if (removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
+            modified = true;
         } else {
             buf.insert(buf.end(), table + pos, table + pos + 5 + esInfoLength);
         }
@@ -1465,19 +1581,29 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
     buf[2] = 0xb0 | (uint8_t)((buf.size() + 4 - 4) >> 8);
     buf[3] = (uint8_t)(buf.size() + 4 - 4);
 
-    if (m_lastPmt.size() == buf.size() + 4 &&
-        std::equal(buf.begin(), buf.end(), m_lastPmt.begin())) {
-        buf.insert(buf.end(), m_lastPmt.end() - 4, m_lastPmt.end()); // copy CRC
+    auto& lastPmt = m_lastPmts[pmtPid];
+    if (!lastPmt.empty()) {
+        // 入力側のversionではなく、直前に出力したversionを基準に比較・更新する。
+        buf[6] = (buf[6] & 0xc1) | (lastPmt[6] & 0x3e);
+    }
+
+    if (lastPmt.size() == buf.size() + 4 &&
+        std::equal(buf.begin(), buf.end(), lastPmt.begin())) {
+        buf.insert(buf.end(), lastPmt.end() - 4, lastPmt.end()); // copy CRC
+    } else if (lastPmt.empty() && !modified) {
+        // 最初の出力が無変更なら、放送波のversionとCRCをそのまま使う。
+        buf.insert(buf.end(), table + tableLen, table + tableLen + 4);
+        lastPmt = buf;
     } else {
+        const int lastVersion = lastPmt.empty() ? ((table[5] >> 1) & 0x1f) : ((lastPmt[6] >> 1) & 0x1f);
+        buf[6] = (buf[6] & 0xc1) | (((lastVersion + 1) & 0x1f) << 1);
         const uint32_t crc = calc_crc32(buf.data() + 1, static_cast<int>(buf.size() - 1));
         buf.push_back(crc >> 24);
         buf.push_back((crc >> 16) & 0xff);
         buf.push_back((crc >> 8) & 0xff);
         buf.push_back(crc & 0xff);
-        m_lastPmt = buf;
+        lastPmt = buf;
     }
-
-    const auto PMT_PID = m_demuxer->selectServiceID()->pmt_pid;
 
     // Create TS packets
     RGYTSPacket pkt;
@@ -1485,13 +1611,16 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result) {
     for (size_t i = 0; i < buf.size(); i += 184) {
         pkt.packet.clear();
         pkt.packet.push_back(0x47);
-        pkt.packet.push_back((i == 0 ? 0x40 : 0) | (uint8_t)(PMT_PID >> 8));
-        pkt.packet.push_back((uint8_t)(PMT_PID & 0xff));
-        m_pmtCounter = (m_pmtCounter + 1) & 0x0f;
-        pkt.packet.push_back(0x10 | m_pmtCounter);
+        pkt.packet.push_back((i == 0 ? 0x40 : 0) | (uint8_t)(pmtPid >> 8));
+        pkt.packet.push_back((uint8_t)(pmtPid & 0xff));
+        auto& pmtCounter = m_pmtCounters[pmtPid];
+        pmtCounter = (pmtCounter + 1) & 0x0f;
+        pkt.packet.push_back(0x10 | pmtCounter);
         pkt.packet.insert(pkt.packet.end(), buf.begin() + i, buf.begin() + std::min(i + 184, buf.size()));
         pkt.packet.resize(((pkt.packet.size() - 1) / 188 + 1) * 188, 0xff);
-        writePacket(&pkt);
+        if (auto err = writePacket(&pkt); err != RGY_ERR_NONE) {
+            return err;
+        }
     }
     return RGY_ERR_NONE;
 }
@@ -1776,7 +1905,7 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
     m_vidPIDReplace = service->vid.stream.pid;
     AddMessage(RGY_LOG_INFO, _T("Target service ID %d, replace vid pid: 0x%04x (%d).\n"), service->programNumber, m_vidPIDReplace, m_vidPIDReplace);
 
-    if (service->pidPcr == service->vid.stream.pid) {
+    if (!m_trimOnly && service->pidPcr == service->vid.stream.pid) {
         // PCRが映像のストリームに含まれる場合は、別PIDで独立したPCRパケットを生成する
         // 空いているPIDを探す
         auto pcr_pid_high = std::max((service->vid.stream.pid & 0xff00), 0x0100);
@@ -2006,10 +2135,11 @@ RGY_ERR TSReplace::restruct() {
     int64_t m_pcr = TIMESTAMP_INVALID_VALUE;
     int64_t curTimestamp = TIMESTAMP_INVALID_VALUE;
     std::unique_ptr<RGYTSDemuxResult> pmtResult;
+    int pmtResultPid = 0;
     uniqueRGYTSPacket patPacket(nullptr, RGYTSPacketDeleter(nullptr));
 
     // 出力状態の初期化
-    auto outputState = (m_replaceDelay > 0 && m_outputStartTimestamp != TIMESTAMP_INVALID_VALUE) ? TSROutputState::Cutting : TSROutputState::Output;
+    auto outputState = (!m_trimOnly && m_replaceDelay > 0 && m_outputStartTimestamp != TIMESTAMP_INVALID_VALUE) ? TSROutputState::Cutting : TSROutputState::Output;
     bool replaceDelayOutputAudioStarted = false; // m_replaceDelay > 0の場合に、音声出力を開始したかどうかのフラグ
 
     //本解析
@@ -2022,7 +2152,7 @@ RGY_ERR TSReplace::restruct() {
         }
 
         for (auto& tspkt : tsPackets) {
-            if (outputState == TSROutputState::Output && pat) {
+            if (!m_trimOnly && outputState == TSROutputState::Output && pat) {
                 if (tspkt->header.PID == 0x00) { //PAT
                     if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                         return err;
@@ -2047,9 +2177,11 @@ RGY_ERR TSReplace::restruct() {
             } else if (const auto pcrCur = m_demuxer->pcr(); pcrCur != TIMESTAMP_INVALID_VALUE) {
                 curTimestamp = pcrCur;
             }
+            const bool removeTypeD = shouldRemoveTypeD(curTimestamp);
 
             // 映像EOF+マージンを超えたら出力を打ち切る (PTS wrap を考慮)
             if (outputState == TSROutputState::Output
+                && !m_trimOnly
                 && m_endAtReplaceEOF
                 && m_outputEndTimestamp != TIMESTAMP_INVALID_VALUE
                 && curTimestamp != TIMESTAMP_INVALID_VALUE
@@ -2067,6 +2199,7 @@ RGY_ERR TSReplace::restruct() {
                         patPacket = std::move(tspkt);
                     } else if (ret.type == RGYTSPacketType::PMT) {
                         pmtResult = std::make_unique<RGYTSDemuxResult>(std::move(ret));
+                        pmtResultPid = tspkt->header.PID;
                     }
                     continue;
                 }
@@ -2079,8 +2212,10 @@ RGY_ERR TSReplace::restruct() {
                     } else if (pat) {
                         writeReplacedPAT(pat);
                     }
-                    if (pmtResult) {
-                        writeReplacedPMT(*pmtResult);
+                    if (pmtResult && pmtResult->psi && pmtResult->psi->version_number) {
+                        if (auto err = writeReplacedPMT(*pmtResult, pmtResultPid, removeTypeD, true); err != RGY_ERR_NONE) {
+                            return err;
+                        }
                         pmtResult.reset();
                     }
                 }
@@ -2093,14 +2228,24 @@ RGY_ERR TSReplace::restruct() {
                 } else if (pat) {
                     writeReplacedPAT(pat);
                 }
-                if (pmtResult) {
-                    writeReplacedPMT(*pmtResult);
+                if (pmtResult && pmtResult->psi && pmtResult->psi->version_number) {
+                    if (auto err = writeReplacedPMT(*pmtResult, pmtResultPid, removeTypeD, true); err != RGY_ERR_NONE) {
+                        return err;
+                    }
                     pmtResult.reset();
                     if (m_startPoint == TSRReplaceStartPoint::FirstPacket) {
                         m_vidDTSOutMax = m_vidFirstTimestamp = getStartPointPTS();
-                        if (auto err2 = writeReplacedVideo(); (err2 != RGY_ERR_NONE && err2 != RGY_ERR_MORE_DATA)) {
-                            return err2;
+                        if (!m_trimOnly) {
+                            if (auto err2 = writeReplacedVideo(); (err2 != RGY_ERR_NONE && err2 != RGY_ERR_MORE_DATA)) {
+                                return err2;
+                            }
                         }
+                    }
+                }
+            } else if (m_trimOnly && ret.type == RGYTSPacketType::PMT) {
+                if (ret.psi && ret.psi->version_number) {
+                    if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
+                        return err;
                     }
                 }
             } else {
@@ -2109,8 +2254,10 @@ RGY_ERR TSReplace::restruct() {
                     switch (ret.type) {
                     case RGYTSPacketType::PMT:
                         service = m_demuxer->service();
-                        if (tspkt->header.PayloadStartFlag) {
-                            writeReplacedPMT(ret);
+                        if (ret.psi && ret.psi->version_number) {
+                            if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, true); err != RGY_ERR_NONE) {
+                                return err;
+                            }
                         }
                         break;
                     case RGYTSPacketType::PCR: {
@@ -2123,12 +2270,12 @@ RGY_ERR TSReplace::restruct() {
                             }
                         }
                         m_pcr = pcr;
-                        if (pat) {
+                        if (!m_trimOnly && pat) {
                             if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                                 return err;
                             }
                         }
-                        if (m_pcrPIDReplace) {
+                        if (!m_trimOnly && m_pcrPIDReplace) {
                             writeReplacedPCR(ret.pcr);
                         } else {
                             writePacket(tspkt.get());
@@ -2136,6 +2283,10 @@ RGY_ERR TSReplace::restruct() {
                         break;
                     }
                     case RGYTSPacketType::VID:
+                        if (m_trimOnly) {
+                            writePacket(tspkt.get());
+                            break;
+                        }
                         // PCRが映像のストリームに含まれる場合は、別PIDで独立したPCRパケットを生成する
                         if (m_pcrPIDReplace && ret.pcr != TIMESTAMP_INVALID_VALUE) {
                             writeReplacedPCR(ret.pcr);
@@ -2160,11 +2311,12 @@ RGY_ERR TSReplace::restruct() {
                         }
                         break;
                     case RGYTSPacketType::OTHER:
-                        if (m_removeTypeD && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                        if (removeTypeD && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                            m_removedTypeDPackets++;
                             // データ放送の削除 -> 出力しない
                         } else {
                             bool outputPkt = true;
-                            if (m_replaceDelay > 0 && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
+                            if (!m_trimOnly && m_replaceDelay > 0 && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
                                 if (!replaceDelayOutputAudioStarted) {
                                     // まだ出力を開始していない音声
                                     const auto audioSampleThreshold = 1024 * TS_TIMEBASE / 48000;
@@ -2185,7 +2337,13 @@ RGY_ERR TSReplace::restruct() {
                         break;
                     }
                 // 以下、サービス外のパケットか、対象のサービスでないパケット
-                } else if (m_removeTypeD && ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                } else if (ret.type == RGYTSPacketType::PMT && !m_removeNonTargetService
+                    && ret.psi && ret.psi->version_number && m_removeTypeDMode != TSRRemoveTypeDMode::Disabled) {
+                    if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
+                        return err;
+                    }
+                } else if (removeTypeD && ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                    m_removedTypeDPackets++;
                     // データ放送の削除 -> 出力しない
                 } else if (m_removeNonTargetService && ret.programNumber > 0) {
                     // 対象サービスでない、他のサービスに属するパケットの場合(ret.programNumber > 0)、そのパケットは削除する -> 出力しない
@@ -2212,7 +2370,7 @@ static void show_version() {
 }
 
 static void show_help() {
-    tstring str = _T("tsreplace -i <input ts file> -r <replace video file> -o <output ts file>\n");
+    tstring str = _T("tsreplace -i <input ts file> [-r <replace video file>] -o <output ts file>\n");
 
     str +=
         _T("\n")
@@ -2242,7 +2400,8 @@ static void show_help() {
 
         _T("   --(no-)add-aud               auto insert aud unit\n")
         _T("   --(no-)add-headers           auto insert headers\n")
-        _T("   --(no-)remove-typed          remove type-d packets\n")
+        _T("   --(no-)remove-typed          remove type-d packets from the entire stream\n")
+        _T("   --smart-remove-typed         keep type-d in the first/middle/last 60 sec\n")
         _T("\n")
         _T("   --replace-format <string>    set replace file format\n")
         _T("\n")
@@ -2445,11 +2604,15 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
         return 0;
     }
     if (IS_OPTION("remove-typed")) {
-        prm.removeTypeD = true;
+        prm.removeTypeDMode = TSRRemoveTypeDMode::All;
+        return 0;
+    }
+    if (IS_OPTION("smart-remove-typed")) {
+        prm.removeTypeDMode = TSRRemoveTypeDMode::Smart;
         return 0;
     }
     if (IS_OPTION("no-remove-typed")) {
-        prm.removeTypeD = false;
+        prm.removeTypeDMode = TSRRemoveTypeDMode::Disabled;
         return 0;
     }
     if (IS_OPTION("service")) {
@@ -2606,8 +2769,9 @@ int _tmain(const int argc, const TCHAR **argv) {
         _ftprintf(stderr, _T("ERROR: input file not set.\n"));
         return 1;
     }
-    if (prm.replacefile.size() == 0 && prm.encoderPath.size() == 0) {
-        _ftprintf(stderr, _T("ERROR: replace video file or encoder path not set.\n"));
+    const bool trimOnly = prm.replacefile.empty() && prm.encoderPath.empty();
+    if (trimOnly && prm.removeTypeDMode == TSRRemoveTypeDMode::Disabled) {
+        _ftprintf(stderr, _T("ERROR: replace video file, encoder path, or a Type-D trim option must be set.\n"));
         return 1;
     }
     if (prm.replacefile.size() > 0 && prm.encoderPath.size() > 0) {
@@ -2616,6 +2780,14 @@ int _tmain(const int argc, const TCHAR **argv) {
     }
     if (prm.output.size() == 0) {
         _ftprintf(stderr, _T("ERROR: output file not set.\n"));
+        return 1;
+    }
+    if (prm.removeTypeDMode == TSRRemoveTypeDMode::Smart && prm.input == _T("-")) {
+        _ftprintf(stderr, _T("ERROR: --smart-remove-typed requires a seekable input file.\n"));
+        return 1;
+    }
+    if (trimOnly && (prm.replaceDelay != 0 || prm.endAtReplaceEOF)) {
+        _ftprintf(stderr, _T("ERROR: --replace-delay and --end-at-replace-eof require video replacement.\n"));
         return 1;
     }
     if (prm.output != _T("-")

@@ -30,6 +30,7 @@
 
 #include <memory>
 #include <deque>
+#include <map>
 #include <thread>
 #include <mutex>
 #include "rgy_tsdemux.h"
@@ -41,6 +42,12 @@ enum class TSRReplaceStartPoint {
     KeyframPts,
     FirstFrame,
     FirstPacket,
+};
+
+enum class TSRRemoveTypeDMode {
+    Disabled,
+    All,
+    Smart,
 };
 
 static const CX_DESC list_startpoint[] = {
@@ -207,7 +214,7 @@ struct TSRReplaceParams {
     std::vector<tstring> encoderArgs;
     bool addAud;
     bool addHeaders;
-    bool removeTypeD;
+    TSRRemoveTypeDMode removeTypeDMode;
     bool removeNonTargetService;
     int selectService;
     bool copyFileTs;
@@ -243,7 +250,7 @@ protected:
     RGY_ERR writePacket(const RGYTSPacket *pkt);
     RGY_ERR writeReplacedPCR(const uint64_t pcr);
     RGY_ERR writeReplacedPAT(const RGYTS_PAT *pat);
-    RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result);
+    RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, bool removeTypeD, bool replaceVideo);
     RGY_ERR writeReplacedVideo();
     RGY_ERR writeReplacedVideo(AVPacket *pkt);
     int64_t getOrigPtsOffset();
@@ -253,6 +260,8 @@ protected:
     uint8_t getAudValue(const AVPacket *pkt) const;
     std::tuple<RGY_ERR, bool, bool> checkPacket(const AVPacket *pkt);
     int64_t getStartPointPTS() const;
+    RGY_ERR probeInputDuration();
+    bool shouldRemoveTypeD(int64_t timestamp) const;
 
     void AddMessage(RGYLogLevel log_level, const tstring &str) {
         if (m_log == nullptr || log_level < m_log->getLogLevel(RGY_LOGT_APP)) {
@@ -312,15 +321,19 @@ protected:
     int64_t m_vidFirstTimestamp;       // 起点のtimestamp
     int64_t m_vidFirstPacketPTS;       // 最初のパケットのPTS
     std::vector<uint8_t> m_lastPat; // 直前の出力PATデータ
-    std::vector<uint8_t> m_lastPmt; // 直前の出力PMTデータ
+    std::map<int, std::vector<uint8_t>> m_lastPmts; // PIDごとの直前の出力PMTデータ
     std::unique_ptr<TSReplaceVideo> m_videoReplace; // 置き換え対象の動画の読み込み用
     uint8_t m_patCounter; // 出力PATのカウンタ
-    uint8_t m_pmtCounter; // 出力PMTのカウンタ
+    std::map<int, uint8_t> m_pmtCounters; // PIDごとの出力PMTのカウンタ
     uint8_t m_vidCounter; // 出力映像のカウンタ
     int64_t m_ptswrapOffset; // PCR wrapの加算分
     bool m_addAud; // audの挿入
     bool m_addHeaders; // ヘッダの挿入
-    bool m_removeTypeD; // データの削除
+    TSRRemoveTypeDMode m_removeTypeDMode; // Type-Dデータの削除モード
+    bool m_trimOnly; // 映像を置換せずType-D trimのみ行う
+    int64_t m_inputDuration; // 入力TSの長さ (90kHz単位)
+    uint64_t m_removedTypeDPackets; // 削除したType-Dパケット数
+    bool m_typeDStatsLogged;
     bool m_removeNonTargetService; // 非対象serviceの削除
     int m_selectService; // 出力するserviceの番号
     bool m_copyFileTs; // ファイルのタイムスタンプをコピー
