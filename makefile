@@ -7,7 +7,7 @@ OBJS  = $(SRCS:%.cpp=%.cpp.o)
 all: $(PROGRAM)
 
 $(PROGRAM): .depend $(OBJS)
-	$(LD) $(OBJS) $(LDFLAGS) -o $(PROGRAM)
+	$(CXX) $(OBJS) $(LDFLAGS) -o $(PROGRAM)
 
 %_sse2.cpp.o: %_sse2.cpp .depend
 	$(CXX) -c $(CXXFLAGS) -msse2 -o $@ $<
