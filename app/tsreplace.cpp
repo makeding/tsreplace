@@ -25,7 +25,10 @@
 //
 // ------------------------------------------------------------------------------------------
 
+#include <cmath>
+#include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #include <thread>
 #if defined(_WIN32) || defined(_WIN64)
@@ -43,6 +46,7 @@ static const TCHAR *serviceNum[] = {_T(""), _T("1st"), _T("2nd"), _T("3rd"), _T(
 
 static const int64_t WRAP_AROUND_VALUE = (1LL << 33);
 static const int64_t WRAP_AROUND_CHECK_VALUE = ((1LL << 32) - 1);
+static const int64_t SMART_REMOVE_TYPED_TIMEBASE = 90000;
 
 // TS の 33bit PTS/PCR 同士の差分 (a - b) を、wrap を考慮して返す
 static int64_t diffTimestampTsAMinusB(int64_t a, int64_t b) {
@@ -173,6 +177,7 @@ TSRReplaceParams::TSRReplaceParams() :
     addAud(true),
     addHeaders(true),
     removeTypeDMode(TSRRemoveTypeDMode::Disabled),
+    smartRemoveTypeDDuration(0),
     removeNonTargetService(true),
     selectService(0),
     copyFileTs(false) {
@@ -1103,58 +1108,17 @@ RGY_ERR TSReplace::close() {
     return sts;
 }
 
-RGY_ERR TSReplace::probeInputDuration() {
-    if (_tcscmp(m_fileTS.c_str(), _T("-")) == 0) {
-        AddMessage(RGY_LOG_ERROR, _T("--smart-remove-typed requires a seekable input file; stdin is not supported.\n"));
-        return RGY_ERR_UNSUPPORTED;
-    }
-
-    std::string filename;
-    if (0 == tchar_to_string(m_fileTS.c_str(), filename, CP_UTF8)) {
-        AddMessage(RGY_LOG_ERROR, _T("Failed to convert input filename to UTF-8.\n"));
-        return RGY_ERR_UNSUPPORTED;
-    }
-
-    AVFormatContext *formatCtx = nullptr;
-    int ret = avformat_open_input(&formatCtx, filename.c_str(), nullptr, nullptr);
-    if (ret < 0) {
-        AddMessage(RGY_LOG_ERROR, _T("Failed to probe input duration: %s\n"), qsv_av_err2str(ret).c_str());
-        return RGY_ERR_FILE_OPEN;
-    }
-
-    ret = avformat_find_stream_info(formatCtx, nullptr);
-    if (ret < 0) {
-        AddMessage(RGY_LOG_ERROR, _T("Failed to read input stream information: %s\n"), qsv_av_err2str(ret).c_str());
-        avformat_close_input(&formatCtx);
-        return RGY_ERR_INVALID_FORMAT;
-    }
-
-    int64_t duration = formatCtx->duration;
-    if (duration == AV_NOPTS_VALUE || duration <= 0) {
-        duration = 0;
-        for (unsigned int i = 0; i < formatCtx->nb_streams; i++) {
-            const auto stream = formatCtx->streams[i];
-            if (stream->duration != AV_NOPTS_VALUE && stream->duration > 0) {
-                duration = std::max(duration, av_rescale_q(stream->duration, stream->time_base, AV_TIME_BASE_Q));
-            }
-        }
-    }
-    avformat_close_input(&formatCtx);
-
+RGY_ERR TSReplace::setSmartRemoveTypeDDuration(int64_t duration) {
     if (duration <= 0) {
-        AddMessage(RGY_LOG_ERROR, _T("--smart-remove-typed could not determine the input duration.\n"));
-        return RGY_ERR_INVALID_FORMAT;
+        AddMessage(RGY_LOG_ERROR, _T("--smart-remove-typed duration must be greater than zero.\n"));
+        return RGY_ERR_INVALID_PARAM;
     }
 
-    m_inputDuration = av_rescale(duration, TS_TIMEBASE, AV_TIME_BASE);
+    m_inputDuration = duration;
     const double durationSec = m_inputDuration / (double)TS_TIMEBASE;
-    const double middleSec = durationSec * 0.5;
-    AddMessage(RGY_LOG_INFO, _T("Input duration: %.3f sec.\n"), durationSec);
-    AddMessage(RGY_LOG_INFO,
-        _T("Smart Type-D keep windows: [0.000, %.3f], [%.3f, %.3f], [%.3f, %.3f] sec.\n"),
-        std::min(60.0, durationSec),
-        std::max(0.0, middleSec - 30.0), std::min(durationSec, middleSec + 30.0),
-        std::max(0.0, durationSec - 60.0), durationSec);
+    const double keepEndStartSec = std::max(0.0, durationSec - 60.0);
+    AddMessage(RGY_LOG_INFO, _T("Smart Type-D planned end: %.3f sec; keep [%.3f, %.3f] sec.\n"),
+        durationSec, keepEndStartSec, durationSec);
     return RGY_ERR_NONE;
 }
 
@@ -1165,7 +1129,7 @@ bool TSReplace::shouldRemoveTypeD(int64_t timestamp) const {
     if (m_removeTypeDMode == TSRRemoveTypeDMode::All) {
         return true;
     }
-    if (timestamp == TIMESTAMP_INVALID_VALUE || m_vidFirstPacketPTS == TIMESTAMP_INVALID_VALUE || m_inputDuration <= 0) {
+    if (timestamp == TIMESTAMP_INVALID_VALUE || m_vidFirstPacketPTS == TIMESTAMP_INVALID_VALUE) {
         return false;
     }
 
@@ -1174,14 +1138,13 @@ bool TSReplace::shouldRemoveTypeD(int64_t timestamp) const {
         return false;
     }
 
-    const int64_t minute = 60LL * TS_TIMEBASE;
-    const int64_t halfMinute = 30LL * TS_TIMEBASE;
-    const int64_t middle = m_inputDuration / 2;
-    const bool keepStart = elapsed <= std::min(minute, m_inputDuration);
-    const bool keepMiddle = elapsed >= std::max<int64_t>(0, middle - halfMinute)
-        && elapsed <= std::min(m_inputDuration, middle + halfMinute);
-    const bool keepEnd = elapsed >= std::max<int64_t>(0, m_inputDuration - minute);
-    return !(keepStart || keepMiddle || keepEnd);
+    const int64_t keepDuration = 60LL * TS_TIMEBASE;
+    const int64_t keepInterval = 870LL * TS_TIMEBASE; // 14.5 minutes
+    const bool keepPeriodic = (elapsed % keepInterval) <= keepDuration;
+    const bool keepEnd = m_inputDuration > 0
+        && elapsed >= std::max<int64_t>(0, m_inputDuration - keepDuration)
+        && elapsed <= m_inputDuration;
+    return !(keepPeriodic || keepEnd);
 }
 
 RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prms) {
@@ -1237,8 +1200,11 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     AddMessage(RGY_LOG_INFO, _T("Copy File Timestamp: %s.\n"), m_copyFileTs ? _T("on") : _T("off"));
 
     if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart) {
-        if (auto sts = probeInputDuration(); sts != RGY_ERR_NONE) {
-            return sts;
+        AddMessage(RGY_LOG_INFO, _T("Smart Type-D keep schedule: keep 60 sec every 870 sec until EOF.\n"));
+        if (prms.smartRemoveTypeDDuration > 0) {
+            if (auto sts = setSmartRemoveTypeDDuration(prms.smartRemoveTypeDDuration); sts != RGY_ERR_NONE) {
+                return sts;
+            }
         }
     }
 
@@ -2401,7 +2367,9 @@ static void show_help() {
         _T("   --(no-)add-aud               auto insert aud unit\n")
         _T("   --(no-)add-headers           auto insert headers\n")
         _T("   --(no-)remove-typed          remove type-d packets from the entire stream\n")
-        _T("   --smart-remove-typed         keep type-d in the first/middle/last 60 sec\n")
+        _T("   --smart-remove-typed         keep type-d for 60 sec every 14.5 minutes\n")
+        _T("   --smart-remove-typed-duration <seconds>\n")
+        _T("                                 also keep the final 60 sec before the planned end\n")
         _T("\n")
         _T("   --replace-format <string>    set replace file format\n")
         _T("\n")
@@ -2611,6 +2579,26 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
         prm.removeTypeDMode = TSRRemoveTypeDMode::Smart;
         return 0;
     }
+    if (IS_OPTION("smart-remove-typed-duration")) {
+        if (i + 1 >= argc) {
+            _ftprintf(stderr, _T("Value for --%s is required.\n"), option_name);
+            return 1;
+        }
+        i++;
+        try {
+            const double durationSec = std::stod(strInput[i]);
+            if (!std::isfinite(durationSec) || durationSec <= 0.0
+                || durationSec > (double)std::numeric_limits<int64_t>::max() / SMART_REMOVE_TYPED_TIMEBASE) {
+                throw std::out_of_range("duration");
+            }
+            prm.smartRemoveTypeDDuration = (int64_t)std::llround(durationSec * SMART_REMOVE_TYPED_TIMEBASE);
+            prm.removeTypeDMode = TSRRemoveTypeDMode::Smart;
+        } catch (...) {
+            _ftprintf(stderr, _T("Unknown value for --%s: \"%s\"\n"), option_name, strInput[i]);
+            return 1;
+        }
+        return 0;
+    }
     if (IS_OPTION("no-remove-typed")) {
         prm.removeTypeDMode = TSRRemoveTypeDMode::Disabled;
         return 0;
@@ -2780,10 +2768,6 @@ int _tmain(const int argc, const TCHAR **argv) {
     }
     if (prm.output.size() == 0) {
         _ftprintf(stderr, _T("ERROR: output file not set.\n"));
-        return 1;
-    }
-    if (prm.removeTypeDMode == TSRRemoveTypeDMode::Smart && prm.input == _T("-")) {
-        _ftprintf(stderr, _T("ERROR: --smart-remove-typed requires a seekable input file.\n"));
         return 1;
     }
     if (trimOnly && (prm.replaceDelay != 0 || prm.endAtReplaceEOF)) {

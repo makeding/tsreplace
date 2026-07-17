@@ -215,6 +215,7 @@ struct TSRReplaceParams {
     bool addAud;
     bool addHeaders;
     TSRRemoveTypeDMode removeTypeDMode;
+    int64_t smartRemoveTypeDDuration;
     bool removeNonTargetService;
     int selectService;
     bool copyFileTs;
@@ -260,7 +261,7 @@ protected:
     uint8_t getAudValue(const AVPacket *pkt) const;
     std::tuple<RGY_ERR, bool, bool> checkPacket(const AVPacket *pkt);
     int64_t getStartPointPTS() const;
-    RGY_ERR probeInputDuration();
+    RGY_ERR setSmartRemoveTypeDDuration(int64_t duration);
     bool shouldRemoveTypeD(int64_t timestamp) const;
 
     void AddMessage(RGYLogLevel log_level, const tstring &str) {
@@ -331,7 +332,7 @@ protected:
     bool m_addHeaders; // ヘッダの挿入
     TSRRemoveTypeDMode m_removeTypeDMode; // Type-Dデータの削除モード
     bool m_trimOnly; // 映像を置換せずType-D trimのみ行う
-    int64_t m_inputDuration; // 入力TSの長さ (90kHz単位)
+    int64_t m_inputDuration; // 予定終了時間 (先頭からの90kHz単位、未指定時は無効値)
     uint64_t m_removedTypeDPackets; // 削除したType-Dパケット数
     bool m_typeDStatsLogged;
     bool m_removeNonTargetService; // 非対象serviceの削除
