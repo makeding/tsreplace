@@ -31,6 +31,7 @@
 #include <memory>
 #include <deque>
 #include <map>
+#include <set>
 #include <thread>
 #include <mutex>
 #include "rgy_tsdemux.h"
@@ -249,6 +250,8 @@ protected:
     RGY_ERR initEncoder();
     RGY_ERR readTS(std::vector<uniqueRGYTSPacket>& packetBuffer);
     RGY_ERR writePacket(const RGYTSPacket *pkt);
+    RGY_ERR writeTypeDPacket(RGYTSPacket *pkt);
+    void markTypeDPacketRemoved(const RGYTSPacket *pkt);
     RGY_ERR writeReplacedPCR(const uint64_t pcr);
     RGY_ERR writeReplacedPAT(const RGYTS_PAT *pat);
     RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, bool removeTypeD, bool replaceVideo);
@@ -335,6 +338,8 @@ protected:
     int64_t m_inputDuration; // 予定終了時間 (先頭からの90kHz単位、未指定時は無効値)
     uint64_t m_removedTypeDPackets; // 削除したType-Dパケット数
     bool m_typeDStatsLogged;
+    std::map<int, uint8_t> m_typeDOutputCounters; // PIDごとの直前の出力continuity_counter
+    std::set<int> m_typeDRewriteCounters; // パケット削除後にcontinuity_counterを書き換えるPID
     bool m_removeNonTargetService; // 非対象serviceの削除
     int m_selectService; // 出力するserviceの番号
     bool m_copyFileTs; // ファイルのタイムスタンプをコピー

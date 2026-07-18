@@ -1024,6 +1024,8 @@ TSReplace::TSReplace() :
     m_inputDuration(TIMESTAMP_INVALID_VALUE),
     m_removedTypeDPackets(0),
     m_typeDStatsLogged(false),
+    m_typeDOutputCounters(),
+    m_typeDRewriteCounters(),
     m_removeNonTargetService(true),
     m_selectService(0),
     m_copyFileTs(false),
@@ -1403,6 +1405,31 @@ RGY_ERR TSReplace::writePacket(const RGYTSPacket *pkt) {
         return RGY_ERR_OUT_OF_RESOURCES;
     }
     return RGY_ERR_NONE;
+}
+
+void TSReplace::markTypeDPacketRemoved(const RGYTSPacket *pkt) {
+    if (m_typeDOutputCounters.count(pkt->header.PID) > 0) {
+        m_typeDRewriteCounters.insert(pkt->header.PID);
+    }
+}
+
+RGY_ERR TSReplace::writeTypeDPacket(RGYTSPacket *pkt) {
+    const auto pid = pkt->header.PID;
+    const auto counter = pkt->header.Counter;
+    const auto previous = m_typeDOutputCounters.find(pid);
+    if (previous == m_typeDOutputCounters.end()) {
+        m_typeDOutputCounters[pid] = counter;
+    } else if (m_typeDRewriteCounters.count(pid) > 0) {
+        const auto outputCounter = (pkt->header.payloadSize > 0)
+            ? (uint8_t)((previous->second + 1) & 0x0f)
+            : previous->second;
+        pkt->packet[3] = (pkt->packet[3] & 0xf0) | outputCounter;
+        pkt->header.Counter = outputCounter;
+        previous->second = outputCounter;
+    } else {
+        previous->second = counter;
+    }
+    return writePacket(pkt);
 }
 
 uint8_t TSReplace::getvideoDecCtrlEncodeFormat(const int height) {
@@ -2278,6 +2305,7 @@ RGY_ERR TSReplace::restruct() {
                         break;
                     case RGYTSPacketType::OTHER:
                         if (removeTypeD && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                            markTypeDPacketRemoved(tspkt.get());
                             m_removedTypeDPackets++;
                             // データ放送の削除 -> 出力しない
                         } else {
@@ -2295,7 +2323,11 @@ RGY_ERR TSReplace::restruct() {
                                 }
                             }
                             if (outputPkt) {
-                                writePacket(tspkt.get());
+                                if (ret.stream.type == RGYTSStreamType::TYPE_D) {
+                                    writeTypeDPacket(tspkt.get());
+                                } else {
+                                    writePacket(tspkt.get());
+                                }
                             }
                         }
                         break;
@@ -2309,10 +2341,13 @@ RGY_ERR TSReplace::restruct() {
                         return err;
                     }
                 } else if (removeTypeD && ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                    markTypeDPacketRemoved(tspkt.get());
                     m_removedTypeDPackets++;
                     // データ放送の削除 -> 出力しない
                 } else if (m_removeNonTargetService && ret.programNumber > 0) {
                     // 対象サービスでない、他のサービスに属するパケットの場合(ret.programNumber > 0)、そのパケットは削除する -> 出力しない
+                } else if (ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
+                    writeTypeDPacket(tspkt.get());
                 } else {
                     writePacket(tspkt.get());
                 }
