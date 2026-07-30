@@ -2285,7 +2285,7 @@ RGY_ERR TSReplace::restruct() {
                         }
                     }
                 }
-            } else if (m_trimOnly && ret.type == RGYTSPacketType::PMT) {
+            } else if (m_trimOnly && ret.type == RGYTSPacketType::PMT && ret.programNumber > 0) {
                 if (ret.psi && ret.psi->version_number) {
                     if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
                         return err;
@@ -2385,7 +2385,7 @@ RGY_ERR TSReplace::restruct() {
                         break;
                     }
                 // 以下、サービス外のパケットか、対象のサービスでないパケット
-                } else if (ret.type == RGYTSPacketType::PMT && !m_removeNonTargetService
+                } else if (ret.type == RGYTSPacketType::PMT && ret.programNumber > 0 && !m_removeNonTargetService
                     && ret.psi && ret.psi->version_number && m_removeTypeDMode != TSRRemoveTypeDMode::Disabled) {
                     if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
                         return err;
