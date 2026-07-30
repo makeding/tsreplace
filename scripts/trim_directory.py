@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import os
 import re
 import shlex
@@ -44,6 +45,13 @@ REPORT_COLUMNS = (
     "services",
     "message",
 )
+CONTROL_CHARACTERS = re.compile(r"[\x00-\x1F\x7F-\x9F]")
+COMPLETED_REPORT_STATUSES = {
+    "ok",
+    "skipped_protected",
+    "skipped_small_savings",
+    "unchanged",
+}
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,7 @@ class TrimResult:
     original_size: int
     trimmed_size: int
     services: tuple[str, ...]
+    published: bool
 
 
 @dataclass(frozen=True)
@@ -107,11 +116,6 @@ def parse_args() -> argparse.Namespace:
         help="TSDuck tsanalyze executable (default: tsanalyze from PATH)",
     )
     parser.add_argument(
-        "--tscharset",
-        default="tscharset",
-        help="TSDuck tscharset executable (default: tscharset from PATH)",
-    )
-    parser.add_argument(
         "--tstables",
         default="tstables",
         help="TSDuck tstables executable (default: tstables from PATH)",
@@ -143,6 +147,15 @@ def parse_args() -> argparse.Namespace:
         "--no-replace",
         action="store_true",
         help="keep the source and publish the result as <name>-trimed.<suffix>",
+    )
+    parser.add_argument(
+        "--minimum-savings-mib",
+        type=float,
+        default=10.0,
+        help=(
+            "discard the candidate and keep the source when savings are below "
+            "this many MiB (default: 10; use 0 to disable)"
+        ),
     )
     parser.add_argument(
         "--remove-failed-processing",
@@ -350,7 +363,12 @@ def append_report(path: Path, row: dict[str, object]) -> None:
         )
         if needs_header:
             writer.writeheader()
-        writer.writerow(row)
+        writer.writerow(
+            {
+                key: CONTROL_CHARACTERS.sub(" ", str(value))
+                for key, value in row.items()
+            }
+        )
         stream.flush()
         os.fsync(stream.fileno())
 
@@ -374,6 +392,55 @@ def initialize_report(path: Path) -> None:
         writer.writeheader()
         stream.flush()
         os.fsync(stream.fileno())
+
+
+def completed_sources_from_report(
+    path: Path,
+    protected_keywords: list[str],
+    minimum_savings_bytes: int,
+) -> set[Path]:
+    if not path.exists() or path.stat().st_size == 0:
+        return set()
+    completed: set[Path] = set()
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != REPORT_COLUMNS:
+            raise RuntimeError(f"report has an incompatible TSV header: {path}")
+        for row in reader:
+            status = row.get("status")
+            if status not in COMPLETED_REPORT_STATUSES:
+                continue
+            if status == "skipped_protected":
+                title = row.get("program_name", "").casefold()
+                if not any(keyword.casefold() in title for keyword in protected_keywords):
+                    continue
+            if status in {"skipped_small_savings", "unchanged"}:
+                try:
+                    saved_bytes = int(row.get("saved_bytes", ""))
+                except (TypeError, ValueError):
+                    continue
+                if saved_bytes >= minimum_savings_bytes:
+                    continue
+            source_text = row.get("source_path", "")
+            if not source_text:
+                continue
+            source = Path(source_text).expanduser().resolve()
+            candidate_text = row.get("output_path", "")
+            size_text = row.get("original_size", "")
+            candidate = source
+            if row.get("status") == "ok" and candidate_text:
+                candidate = Path(candidate_text).expanduser().resolve()
+                size_text = row.get("trimmed_size", "")
+            try:
+                expected_size = int(size_text)
+            except (TypeError, ValueError):
+                continue
+            try:
+                if candidate.is_file() and candidate.stat().st_size == expected_size:
+                    completed.add(source)
+            except OSError:
+                continue
+    return completed
 
 
 def report_values(
@@ -416,30 +483,6 @@ def report_values(
     }
 
 
-def encode_arib_keywords(tscharset: str, keywords: list[str]) -> dict[str, bytes]:
-    encoded: dict[str, bytes] = {}
-    for keyword in keywords:
-        result = subprocess.run(
-            [tscharset, "--japan", "--encode", keyword],
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout).strip()
-            raise RuntimeError(
-                f"tscharset could not encode protected keyword {keyword!r}"
-                + (f":\n{detail}" if detail else "")
-            )
-        octets = re.findall(r"(?<![0-9A-Fa-f])[0-9A-Fa-f]{2}(?![0-9A-Fa-f])", result.stdout)
-        if not octets:
-            raise RuntimeError(
-                f"tscharset returned no ARIB bytes for protected keyword {keyword!r}"
-            )
-        encoded[keyword] = bytes.fromhex("".join(octets))
-    return encoded
-
-
 def reserve_processing_file(path: Path) -> None:
     with path.open("xb"):
         pass
@@ -455,128 +498,6 @@ def check_available_space(source: Path, source_size: int) -> tuple[int, int]:
             f"(2 x source size) on {source.parent}"
         )
     return free, required
-
-
-def detect_ts_packet_layout(path: Path) -> tuple[int, int]:
-    with path.open("rb") as stream:
-        probe = stream.read(204 * 8)
-    for packet_size, sync_offset in ((188, 0), (192, 4), (204, 0)):
-        if len(probe) >= sync_offset + packet_size * 5 and all(
-            probe[sync_offset + packet_size * index] == 0x47 for index in range(5)
-        ):
-            return packet_size, sync_offset
-    raise RuntimeError("could not detect TS, M2TS, or RS204 packet layout")
-
-
-def find_next_packet_start(
-    data: bytes,
-    start: int,
-    packet_size: int,
-    sync_offset: int,
-) -> int | None:
-    position = start
-    required_syncs = 4
-    last_candidate = len(data) - sync_offset - packet_size * (required_syncs - 1)
-    while position < last_candidate:
-        sync = data.find(b"\x47", position + sync_offset, last_candidate + sync_offset)
-        if sync < 0:
-            return None
-        candidate = sync - sync_offset
-        if all(
-            data[candidate + sync_offset + packet_size * index] == 0x47
-            for index in range(1, required_syncs)
-        ):
-            return candidate
-        position = candidate + 1
-    return None
-
-
-def find_protected_keyword(path: Path, patterns: dict[str, bytes]) -> str | None:
-    if not patterns:
-        return None
-    packet_size, sync_offset = detect_ts_packet_layout(path)
-    packets_per_read = 8192
-    pending = b""
-    section_data = bytearray()
-    last_continuity: int | None = None
-
-    def inspect_complete_sections() -> str | None:
-        while len(section_data) >= 3:
-            if section_data[0] == 0xFF:
-                section_data.clear()
-                return None
-            section_length = ((section_data[1] & 0x0F) << 8) | section_data[2]
-            if section_length > 4093:
-                del section_data[0]
-                continue
-            total_size = 3 + section_length
-            if len(section_data) < total_size:
-                return None
-            section = bytes(section_data[:total_size])
-            del section_data[:total_size]
-            if section[0] != EIT_PRESENT_FOLLOWING_ACTUAL_TABLE_ID:
-                continue
-            for keyword, pattern in patterns.items():
-                if pattern in section:
-                    return keyword
-        return None
-
-    with path.open("rb") as stream:
-        while chunk := stream.read(packet_size * packets_per_read):
-            data = pending + chunk
-            offset = 0
-            while offset + sync_offset + 188 <= len(data):
-                if data[offset + sync_offset] != 0x47:
-                    next_offset = find_next_packet_start(
-                        data, offset + 1, packet_size, sync_offset
-                    )
-                    if next_offset is None:
-                        break
-                    offset = next_offset
-                    section_data.clear()
-                    last_continuity = None
-                packet = data[offset + sync_offset : offset + sync_offset + 188]
-                pid = ((packet[1] & 0x1F) << 8) | packet[2]
-                adaptation_control = (packet[3] >> 4) & 0x03
-                offset += packet_size
-                if pid != EIT_PID or adaptation_control not in (1, 3):
-                    continue
-                if packet[1] & 0x80:
-                    section_data.clear()
-                    last_continuity = None
-                    continue
-                payload_offset = 4
-                if adaptation_control == 3:
-                    payload_offset += 1 + packet[4]
-                if payload_offset >= len(packet):
-                    continue
-                continuity = packet[3] & 0x0F
-                if last_continuity is not None and continuity != (last_continuity + 1) & 0x0F:
-                    section_data.clear()
-                last_continuity = continuity
-                payload = packet[payload_offset:]
-                if packet[1] & 0x40:
-                    pointer = payload[0]
-                    if pointer + 1 > len(payload):
-                        section_data.clear()
-                        continue
-                    if section_data:
-                        section_data.extend(payload[1 : 1 + pointer])
-                        match = inspect_complete_sections()
-                        if match is not None:
-                            return match
-                    section_data.clear()
-                    payload = payload[1 + pointer :]
-                section_data.extend(payload)
-                match = inspect_complete_sections()
-                if match is not None:
-                    return match
-            pending = data[offset:]
-            if len(pending) > packet_size * 16:
-                pending = pending[-packet_size * 16 :]
-                section_data.clear()
-                last_continuity = None
-    return None
 
 
 def validate_with_tsduck(path: Path, tsanalyze: str) -> list[str]:
@@ -643,8 +564,9 @@ def trim_one(
     processing_suffix: str,
     backup_suffix: str | None,
     no_replace: bool,
-    protected_patterns: dict[str, bytes],
+    protected_keywords: list[str],
     program_info: ProgramInfo,
+    minimum_savings_bytes: int,
     dry_run: bool,
     remove_failed_processing: bool,
 ) -> TrimResult | str | None:
@@ -674,11 +596,17 @@ def trim_one(
         )
 
     before = SourceState.read(source)
-    if not dry_run and protected_patterns:
-        print("  EIT scan: protected program-name keywords")
-        protected_keyword = find_protected_keyword(source, protected_patterns)
+    if not dry_run and protected_keywords and program_info.name:
+        protected_keyword = next(
+            (
+                keyword
+                for keyword in protected_keywords
+                if keyword.casefold() in program_info.name.casefold()
+            ),
+            None,
+        )
         if protected_keyword is not None:
-            print(f"  skipped:  protected EIT keyword {protected_keyword!r}")
+            print(f"  skipped:  protected program title keyword {protected_keyword!r}")
             return protected_keyword
     free, required = check_available_space(source, before.size)
     print(f"  free space: {free} bytes (required: {required} bytes)")
@@ -694,18 +622,40 @@ def trim_one(
         if SourceState.read(source) != before:
             raise RuntimeError("source changed while trimming; it may still be recording")
 
-        shutil.copystat(source, processing, follow_symlinks=False)
         trimmed_size = processing.stat().st_size
-        output = install_trimmed_file(source, processing, backup_suffix, no_replace)
         saved = before.size - trimmed_size
         percent = saved * 100.0 / before.size if before.size else 0.0
         print(f"  services: {', '.join(services)}")
+        if saved < minimum_savings_bytes:
+            processing.unlink()
+            print(
+                f"  skipped:  candidate saved {saved} bytes ({percent:.2f}%), "
+                f"below {minimum_savings_bytes} bytes; original retained"
+            )
+            return TrimResult(
+                source,
+                source,
+                before.size,
+                trimmed_size,
+                tuple(services),
+                False,
+            )
+
+        shutil.copystat(source, processing, follow_symlinks=False)
+        output = install_trimmed_file(source, processing, backup_suffix, no_replace)
         print(
             f"  {'created' if no_replace else 'replaced'}: {output} "
             f"({before.size} -> {trimmed_size} bytes, "
             f"saved {saved} bytes, {percent:.2f}%)"
         )
-        return TrimResult(source, output, before.size, trimmed_size, tuple(services))
+        return TrimResult(
+            source,
+            output,
+            before.size,
+            trimmed_size,
+            tuple(services),
+            True,
+        )
     except BaseException:
         if remove_failed_processing:
             processing.unlink(missing_ok=True)
@@ -729,6 +679,9 @@ def main() -> int:
         raise ValueError("--no-replace and --backup-suffix cannot be used together")
     if args.no_report and args.report is not None:
         raise ValueError("--report and --no-report cannot be used together")
+    if not math.isfinite(args.minimum_savings_mib) or args.minimum_savings_mib < 0:
+        raise ValueError("--minimum-savings-mib must be a finite non-negative number")
+    minimum_savings_bytes = int(args.minimum_savings_mib * 1024 * 1024)
 
     report_path: Path | None = None
     if not args.no_report:
@@ -739,13 +692,28 @@ def main() -> int:
         )
 
     extensions = parse_extensions(args.extensions)
-    protected_keywords = [] if args.no_protect_keywords else [
-        *DEFAULT_PROTECTED_KEYWORDS,
-        *args.protect_keyword,
-    ]
-    sources = find_files(directory, extensions, args.recursive)
+    protected_keywords = [*args.protect_keyword]
+    if not args.no_protect_keywords:
+        protected_keywords[:0] = DEFAULT_PROTECTED_KEYWORDS
+    all_sources = find_files(directory, extensions, args.recursive)
+    completed_sources = (
+        completed_sources_from_report(
+            report_path,
+            protected_keywords,
+            minimum_savings_bytes,
+        )
+        if report_path is not None
+        else set()
+    )
+    sources = [source for source in all_sources if source not in completed_sources]
     print(f"directory: {directory}")
-    print(f"files:     {len(sources)}")
+    print(f"files:     {len(all_sources)}")
+    print(f"reported:  {len(all_sources) - len(sources)} already completed")
+    print(f"pending:   {len(sources)}")
+    print(
+        f"minimum savings: {minimum_savings_bytes} bytes "
+        f"({args.minimum_savings_mib:g} MiB)"
+    )
     if report_path is not None:
         print(f"report:    {report_path}{' (not written by dry-run)' if args.dry_run else ''}")
     if not sources:
@@ -755,7 +723,6 @@ def main() -> int:
         tsreplace = args.tsreplace
         tsanalyze = args.tsanalyze
         tstables = args.tstables
-        protected_patterns: dict[str, bytes] = {}
     else:
         tsreplace = resolve_executable(args.tsreplace, "tsreplace")
         tsanalyze = resolve_executable(args.tsanalyze, "tsanalyze")
@@ -764,26 +731,23 @@ def main() -> int:
         print(f"tsreplace: {tsreplace}")
         print(f"tsanalyze: {tsanalyze} ({tsanalyze_version})")
         print(f"tstables:  {tstables}")
-        protected_patterns = {}
         if protected_keywords:
-            tscharset = resolve_executable(args.tscharset, "tscharset")
-            protected_patterns = encode_arib_keywords(tscharset, protected_keywords)
-            print(f"tscharset: {tscharset}")
-            print(f"protected: {', '.join(protected_patterns)}")
+            print(f"protected titles: {', '.join(protected_keywords)}")
         if report_path is not None:
             initialize_report(report_path)
 
     succeeded: list[TrimResult] = []
-    skipped = 0
+    skipped_protected = 0
+    skipped_small = 0
     failed: list[tuple[Path, str]] = []
     for source in sources:
-        process_started_at = datetime.now().astimezone()
+        process_started_at = datetime.now(JST)
         process_started = time.monotonic()
         original_size = source.stat().st_size
         program_info = ProgramInfo()
         metadata_message = ""
         try:
-            if not args.dry_run and report_path is not None:
+            if not args.dry_run and (report_path is not None or protected_keywords):
                 try:
                     program_info = extract_program_info(source, tstables)
                 except Exception as error:
@@ -796,21 +760,35 @@ def main() -> int:
                 processing_suffix=args.processing_suffix,
                 backup_suffix=args.backup_suffix,
                 no_replace=args.no_replace,
-                protected_patterns=protected_patterns,
+                protected_keywords=protected_keywords,
                 program_info=program_info,
+                minimum_savings_bytes=minimum_savings_bytes,
                 dry_run=args.dry_run,
                 remove_failed_processing=args.remove_failed_processing,
             )
             if isinstance(result, TrimResult):
-                succeeded.append(result)
+                status = "ok" if result.published else "skipped_small_savings"
+                if result.published:
+                    succeeded.append(result)
+                else:
+                    skipped_small += 1
                 if report_path is not None:
-                    finished = datetime.now().astimezone()
+                    finished = datetime.now(JST)
+                    message = metadata_message
+                    if not result.published:
+                        small_message = (
+                            f"candidate savings below {minimum_savings_bytes} bytes; "
+                            "original retained"
+                        )
+                        message = (
+                            f"{message}; {small_message}" if message else small_message
+                        )
                     append_report(
                         report_path,
                         report_values(
                             source,
-                            result.output,
-                            "ok",
+                            result.output if result.published else None,
+                            status,
                             program_info,
                             process_started_at,
                             finished,
@@ -818,14 +796,14 @@ def main() -> int:
                             result.original_size,
                             result.trimmed_size,
                             result.services,
-                            metadata_message,
+                            message,
                         ),
                     )
             elif isinstance(result, str):
-                skipped += 1
+                skipped_protected += 1
                 if report_path is not None:
-                    finished = datetime.now().astimezone()
-                    message = f"protected EIT keyword: {result}"
+                    finished = datetime.now(JST)
+                    message = f"protected program title keyword: {result}"
                     if metadata_message:
                         message = f"{metadata_message}; {message}"
                     append_report(
@@ -847,7 +825,7 @@ def main() -> int:
             failed.append((source, str(error)))
             print(f"  FAILED: {error}", file=sys.stderr)
             if report_path is not None and not args.dry_run:
-                finished = datetime.now().astimezone()
+                finished = datetime.now(JST)
                 message = str(error)
                 if metadata_message:
                     message = f"{metadata_message}; {message}"
@@ -876,7 +854,8 @@ def main() -> int:
     total_before = sum(item.original_size for item in succeeded)
     total_after = sum(item.trimmed_size for item in succeeded)
     print(
-        f"\ncomplete: ok={len(succeeded)} skipped={skipped} failed={len(failed)} "
+        f"\ncomplete: ok={len(succeeded)} protected={skipped_protected} "
+        f"small={skipped_small} failed={len(failed)} "
         f"saved={total_before - total_after} bytes"
     )
     for source, error in failed:
