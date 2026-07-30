@@ -42,7 +42,6 @@ class TrimResult:
 
 
 def parse_args() -> argparse.Namespace:
-    repository_tsreplace = Path(__file__).resolve().parent.parent / "tsreplace"
     parser = argparse.ArgumentParser(
         description=(
             "Smart-trim TS files into sibling .processing files, validate them "
@@ -62,8 +61,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tsreplace",
-        default=str(repository_tsreplace),
-        help=f"tsreplace executable (default: {repository_tsreplace})",
+        default="tsreplace",
+        help="tsreplace executable (default: tsreplace from PATH)",
     )
     parser.add_argument(
         "--tsanalyze",
