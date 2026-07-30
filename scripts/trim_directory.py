@@ -21,6 +21,13 @@ from pathlib import Path
 
 DEFAULT_EXTENSIONS = (".m2ts", ".ts")
 DEFAULT_PROTECTED_KEYWORDS = ("紅白歌合戦", "開票速報")
+DEFAULT_SKIPPED_NETWORKS = {
+    6: "110°CS Network 1",
+    7: "110°CS Network 2",
+}
+DEFAULT_SKIPPED_SERVICES = {
+    (4, 211): "BS11",
+}
 EIT_PID = 0x0012
 EIT_PRESENT_FOLLOWING_ACTUAL_TABLE_ID = 0x4E
 JST = timezone(timedelta(hours=9))
@@ -49,6 +56,7 @@ CONTROL_CHARACTERS = re.compile(r"[\x00-\x1F\x7F-\x9F]")
 COMPLETED_REPORT_STATUSES = {
     "ok",
     "skipped_protected",
+    "skipped_channel",
     "skipped_small_savings",
     "unchanged",
 }
@@ -85,6 +93,7 @@ class ProgramInfo:
     duration: str = ""
     service_id: str = ""
     event_id: str = ""
+    original_network_id: int | None = None
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,6 +142,11 @@ def parse_args() -> argparse.Namespace:
         "--no-protect-keywords",
         action="store_true",
         help="disable the default EIT keyword protection",
+    )
+    parser.add_argument(
+        "--no-skip-channels",
+        action="store_true",
+        help="disable the built-in BS11 and 110-degree CS skip list",
     )
     parser.add_argument(
         "--processing-suffix",
@@ -312,6 +326,10 @@ def extract_program_info(path: Path, tstables: str) -> ProgramInfo:
         if not isinstance(table, dict) or table.get("#name") != "EIT":
             continue
         service_id = table.get("service_id", "")
+        try:
+            original_network_id = int(table.get("original_network_id", ""))
+        except (TypeError, ValueError):
+            original_network_id = None
         for event in named_nodes(table, "event"):
             start_text = str(event.get("start_time", ""))
             duration_text = str(event.get("duration", ""))
@@ -338,6 +356,7 @@ def extract_program_info(path: Path, tstables: str) -> ProgramInfo:
                 duration=duration_text,
                 service_id=str(service_id),
                 event_id=str(event.get("event_id", "")),
+                original_network_id=original_network_id,
             )
             candidates.append((start, end, info))
 
@@ -349,6 +368,23 @@ def extract_program_info(path: Path, tstables: str) -> ProgramInfo:
     if containing:
         return containing[0][2]
     return min(candidates, key=lambda item: abs(item[0] - recording_start))[2]
+
+
+def skipped_channel_reason(program: ProgramInfo) -> str | None:
+    network_id = program.original_network_id
+    if network_id is None:
+        return None
+    try:
+        service_id = int(program.service_id)
+    except ValueError:
+        service_id = None
+    service_name = DEFAULT_SKIPPED_SERVICES.get((network_id, service_id))
+    if service_name is not None:
+        return f"built-in channel skip: {service_name} (network={network_id}, service={service_id})"
+    network_name = DEFAULT_SKIPPED_NETWORKS.get(network_id)
+    if network_name is not None:
+        return f"built-in channel skip: {network_name} (network={network_id})"
+    return None
 
 
 def append_report(path: Path, row: dict[str, object]) -> None:
@@ -398,6 +434,7 @@ def completed_sources_from_report(
     path: Path,
     protected_keywords: list[str],
     minimum_savings_bytes: int,
+    skip_channels_enabled: bool,
 ) -> set[Path]:
     if not path.exists() or path.stat().st_size == 0:
         return set()
@@ -414,6 +451,8 @@ def completed_sources_from_report(
                 title = row.get("program_name", "").casefold()
                 if not any(keyword.casefold() in title for keyword in protected_keywords):
                     continue
+            if status == "skipped_channel" and not skip_channels_enabled:
+                continue
             if status in {"skipped_small_savings", "unchanged"}:
                 try:
                     saved_bytes = int(row.get("saved_bytes", ""))
@@ -701,6 +740,7 @@ def main() -> int:
             report_path,
             protected_keywords,
             minimum_savings_bytes,
+            not args.no_skip_channels,
         )
         if report_path is not None
         else set()
@@ -733,11 +773,14 @@ def main() -> int:
         print(f"tstables:  {tstables}")
         if protected_keywords:
             print(f"protected titles: {', '.join(protected_keywords)}")
+        if not args.no_skip_channels:
+            print("skipped channels: BS11, 110°CS Network 1/2")
         if report_path is not None:
             initialize_report(report_path)
 
     succeeded: list[TrimResult] = []
     skipped_protected = 0
+    skipped_channel = 0
     skipped_small = 0
     failed: list[tuple[Path, str]] = []
     for source in sources:
@@ -747,12 +790,50 @@ def main() -> int:
         program_info = ProgramInfo()
         metadata_message = ""
         try:
-            if not args.dry_run and (report_path is not None or protected_keywords):
+            if not args.dry_run and (
+                report_path is not None
+                or protected_keywords
+                or not args.no_skip_channels
+            ):
                 try:
                     program_info = extract_program_info(source, tstables)
                 except Exception as error:
                     metadata_message = f"EIT metadata unavailable: {error}"
                     print(f"\n[{source}]\n  warning:  {metadata_message}")
+            channel_reason = (
+                None
+                if args.dry_run or args.no_skip_channels
+                else skipped_channel_reason(program_info)
+            )
+            if channel_reason is not None:
+                skipped_channel += 1
+                print(f"\n[{source}]")
+                if program_info.name:
+                    print(f"  program:  {program_info.start} {program_info.name}")
+                print(f"  skipped:  {channel_reason}")
+                if report_path is not None:
+                    finished = datetime.now(JST)
+                    message = (
+                        f"{metadata_message}; {channel_reason}"
+                        if metadata_message
+                        else channel_reason
+                    )
+                    append_report(
+                        report_path,
+                        report_values(
+                            source,
+                            None,
+                            "skipped_channel",
+                            program_info,
+                            process_started_at,
+                            finished,
+                            time.monotonic() - process_started,
+                            original_size,
+                            original_size,
+                            message=message,
+                        ),
+                    )
+                continue
             result = trim_one(
                 source=source,
                 tsreplace=tsreplace,
@@ -855,7 +936,7 @@ def main() -> int:
     total_after = sum(item.trimmed_size for item in succeeded)
     print(
         f"\ncomplete: ok={len(succeeded)} protected={skipped_protected} "
-        f"small={skipped_small} failed={len(failed)} "
+        f"channel={skipped_channel} small={skipped_small} failed={len(failed)} "
         f"saved={total_before - total_after} bytes"
     )
     for source, error in failed:
