@@ -26,6 +26,9 @@ Windows 10/11 (x86/x64)
 ### Linux
 Ubuntu 20.04 - 24.04 (x64) ほか
 
+### macOS
+macOS 15 (Apple Silicon / arm64)
+
 ---
 
 ## 基本的な使用方法

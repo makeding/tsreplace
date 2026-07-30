@@ -34,6 +34,9 @@
 #include <chrono>
 #include <thread>
 #include <map>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 #include "rgy_tchar.h"
 #if defined(_M_IX86) || defined(_M_X64) || defined(__x86_64)
 #ifdef _MSC_VER
@@ -224,7 +227,17 @@ std::string getCPUNameARM() {
 #endif
 
 int getCPUName(char *buffer, size_t nSize) {
-#if defined(_M_IX86) || defined(_M_X64) || defined(__x86_64)
+#if defined(__APPLE__)
+    size_t size = nSize;
+    if (sysctlbyname("machdep.cpu.brand_string", buffer, &size, nullptr, 0) != 0 || size <= 1) {
+        size = nSize;
+        if (sysctlbyname("hw.model", buffer, &size, nullptr, 0) != 0) {
+            buffer[0] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+#elif defined(_M_IX86) || defined(_M_X64) || defined(__x86_64)
     int CPUInfo[4] = {-1};
     __cpuid(CPUInfo, 0x80000000);
     unsigned int nExIds = CPUInfo[0];
@@ -436,7 +449,69 @@ double getCPUDefaultClockFromCPUName() {
     return 0.0;
 }
 
-#if defined(_WIN32) || defined(_WIN64)
+#if defined(__APPLE__)
+
+static int getSysctlInt(const char *name, int fallback) {
+    int value = fallback;
+    size_t size = sizeof(value);
+    return (sysctlbyname(name, &value, &size, nullptr, 0) == 0) ? value : fallback;
+}
+
+static size_t getSysctlSize(const char *name) {
+    size_t value = 0;
+    size_t size = sizeof(value);
+    return (sysctlbyname(name, &value, &size, nullptr, 0) == 0) ? value : 0;
+}
+
+bool get_cpu_info(cpu_info_t *cpu_info) {
+    if (cpu_info == nullptr) {
+        return false;
+    }
+    memset(cpu_info, 0, sizeof(cpu_info[0]));
+    cpu_info->logical_cores = std::max(1, getSysctlInt("hw.logicalcpu", 1));
+    cpu_info->physical_cores = std::max(1, getSysctlInt("hw.physicalcpu", cpu_info->logical_cores));
+    cpu_info->physical_cores = std::min(cpu_info->physical_cores, MAX_CORE_COUNT);
+    cpu_info->node_count = 1;
+
+    const int maskBits = std::min<int>(cpu_info->logical_cores, sizeof(size_t) * 8);
+    cpu_info->maskSystem = (maskBits == (int)(sizeof(size_t) * 8))
+        ? (size_t)~0
+        : (((size_t)1 << maskBits) - 1);
+    cpu_info->nodes[0].mask = cpu_info->maskSystem;
+    for (int core = 0; core < cpu_info->physical_cores; core++) {
+        auto& info = cpu_info->proc_list[core];
+        info.processor_id = core;
+        info.core_id = core;
+        info.socket_id = 0;
+        const int firstThread = core * maskBits / cpu_info->physical_cores;
+        const int nextThread = (core + 1) * maskBits / cpu_info->physical_cores;
+        info.logical_cores = std::max(1, nextThread - firstThread);
+        for (int thread = firstThread; thread < nextThread; thread++) {
+            info.mask |= (size_t)1 << thread;
+        }
+    }
+
+    auto addCache = [cpu_info](RGYCacheLevel level, RGYCacheType type, size_t size) {
+        if (size == 0) {
+            return;
+        }
+        const int levelIndex = (int)level - 1;
+        const int cacheIndex = cpu_info->cache_count[levelIndex]++;
+        auto& cache = cpu_info->caches[levelIndex][cacheIndex];
+        cache.level = level;
+        cache.type = type;
+        cache.size = (int)std::min<size_t>(size, INT_MAX);
+        cache.mask = cpu_info->maskSystem;
+        cpu_info->max_cache_level = std::max(cpu_info->max_cache_level, (int)level);
+    };
+    addCache(RGYCacheLevel::L1, RGYCacheType::Instruction, getSysctlSize("hw.l1icachesize"));
+    addCache(RGYCacheLevel::L1, RGYCacheType::Data, getSysctlSize("hw.l1dcachesize"));
+    addCache(RGYCacheLevel::L2, RGYCacheType::Unified, getSysctlSize("hw.l2cachesize"));
+    addCache(RGYCacheLevel::L3, RGYCacheType::Unified, getSysctlSize("hw.l3cachesize"));
+    return true;
+}
+
+#elif defined(_WIN32) || defined(_WIN64)
 
 typedef BOOL (WINAPI *LPFN_GLPI)(PSYSTEM_LOGICAL_PROCESSOR_INFORMATION, PDWORD);
 

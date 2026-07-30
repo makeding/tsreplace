@@ -33,13 +33,18 @@
 #include <string>
 #include <memory>
 #include <array>
+#if defined(__APPLE__)
+#include <mutex>
+#endif
 #include "rgy_tchar.h"
 
 //NVEnc.auo/QSVEnc.auoビルド時、/clrでは<thread>は使用できませんなどと出るので、
 //前方宣言で回避する
+#if !defined(__APPLE__)
 namespace std {
     class mutex;
 }
+#endif
 
 enum RGYLogLevel {
     RGY_LOG_TRACE = -3,

@@ -175,7 +175,11 @@ tstring getOSVersion() {
 #else //#if defined(_WIN32) || defined(_WIN64)
 
 #include <sys/utsname.h>
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#else
 #include <sys/sysinfo.h>
+#endif
 
 tstring getOSVersion() {
     std::string str = "";
@@ -253,6 +257,18 @@ uint64_t getPhysicalRamSize(uint64_t *ramUsed) {
         *ramUsed = msex.ullTotalPhys - msex.ullAvailPhys;
     }
     return msex.ullTotalPhys;
+#elif defined(__APPLE__)
+    uint64_t totalRam = 0;
+    size_t totalRamSize = sizeof(totalRam);
+    if (sysctlbyname("hw.memsize", &totalRam, &totalRamSize, nullptr, 0) != 0) {
+        totalRam = 0;
+    }
+    if (ramUsed != nullptr) {
+        // The total is what tsreplace reports. Avoid Mach VM headers here as
+        // they define processor_info_t, which conflicts with cpu_info.h.
+        *ramUsed = 0;
+    }
+    return totalRam;
 #else //#if defined(_WIN32) || defined(_WIN64)
     struct sysinfo info;
     sysinfo(&info);

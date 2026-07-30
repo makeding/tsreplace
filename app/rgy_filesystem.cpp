@@ -914,8 +914,13 @@ bool copyFileTimestamps(const TCHAR* destFile, const TCHAR* sourceFile) {
 
     // タイムスタンプを設定
     struct timespec times[2];
+#if defined(__APPLE__)
+    times[0] = sourceStat.st_atimespec;  // アクセス時刻
+    times[1] = sourceStat.st_mtimespec;  // 更新時刻
+#else
     times[0] = sourceStat.st_atim;  // アクセス時刻
     times[1] = sourceStat.st_mtim;  // 更新時刻
+#endif
 
     // タイムスタンプを適用
     if (utimensat(AT_FDCWD, destFile, times, 0) != 0) {

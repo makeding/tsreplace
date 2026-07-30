@@ -308,7 +308,13 @@ static uint32_t GetCurrentProcessId() {
 }
 
 static uint32_t GetCurrentThreadId() {
+#if defined(__APPLE__)
+    uint64_t threadId = 0;
+    pthread_threadid_np(nullptr, &threadId);
+    return (uint32_t)threadId;
+#else
     return (uint32_t)pthread_self();
+#endif
 }
 
 static pid_t GetCurrentProcess() {
@@ -319,6 +325,21 @@ static pthread_t GetCurrentThread() {
     return pthread_self();
 }
 
+#if defined(__APPLE__)
+// Darwin does not provide the Linux cpu_set_t affinity APIs. Keep the calls as
+// harmless no-ops; tsreplace only uses them for optional CPU topology probing.
+static size_t SetProcessAffinityMask(pid_t process, size_t mask) {
+    return mask;
+}
+
+static size_t SetThreadAffinityMask(pthread_t thread, size_t mask) {
+    return mask;
+}
+
+static bool RGYThreadStillActive(pthread_t thread) {
+    return pthread_kill(thread, 0) == 0;
+}
+#else
 static size_t SetProcessAffinityMask(pid_t process, size_t mask) {
     cpu_set_t cpuset_org;
     CPU_ZERO(&cpuset_org);
@@ -364,6 +385,7 @@ static size_t SetThreadAffinityMask(pthread_t thread, size_t mask) {
 static bool RGYThreadStillActive(pthread_t thread) {
     return pthread_tryjoin_np(thread, nullptr) != 0;
 }
+#endif
 
 static bool RGYProcessExists(uint32_t pid) {
     if (kill(pid, 0) == 0) {

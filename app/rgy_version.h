@@ -37,6 +37,8 @@
 
 #ifdef _M_IX86
 #define BUILD_ARCH_STR _T("x86")
+#elif defined(_M_ARM64) || defined(__aarch64__) || defined(__arm64__)
+#define BUILD_ARCH_STR _T("arm64")
 #else
 #define BUILD_ARCH_STR _T("x64")
 #endif

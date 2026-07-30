@@ -109,10 +109,12 @@ X86_64=1
 ARM64=0
 NO_RDTSCP_INTRIN=0
 ENABLE_LTO=0
+DARWIN=0
 
 ENABLE_CPP_REGEX=1
 
 OPENCL_HEADERS=""
+ENABLE_OPENCL=1
 
 CHECK_LIBAV_NAMES="libswresample libavutil libavcodec libavformat libavfilter"
 LIBAV_STATIC=0
@@ -230,16 +232,21 @@ if ! cxx_check "" ; then
 fi
 cnf_write "OK"
 
-if [ `echo | ${CXX} -E -dM - | egrep "WIN32|WIN64" | wc --lines` -ne 0 ]; then
+if echo | ${CXX} -E -dM - | grep -Eq '^#define (_WIN32|_WIN64) '; then
     cnf_write "This script does not support Windows platform."
     cnf_write "For Windows, use Visual Studio."
     exit 1 
 fi
 
-if [ `echo | ${CXX} -E -dM - | grep "__ARM_ARCH_ISA_A64" | wc --lines` -ne 0 ]; then
+if echo | ${CXX} -E -dM - | grep -Eq '^#define __APPLE__ '; then
+    DARWIN=1
+    ENABLE_OPENCL=0
+fi
+
+if echo | ${CXX} -E -dM - | grep -Eq '^#define (__ARM_ARCH_ISA_A64|__aarch64__|__arm64__) '; then
     ARM64=1
     X86_64=0
-elif [ `echo | ${CXX} -E -dM - | grep "x86_64" | wc --lines` -ne 0 ]; then
+elif echo | ${CXX} -E -dM - | grep -Eq '^#define (__x86_64__|__x86_64) '; then
     ARM64=0
     X86_64=1
 else
@@ -247,13 +254,19 @@ else
     X86_64=0
 fi
 
-CFLAGS="-Wall -Wno-missing-braces -Wno-unknown-pragmas -Wno-unused \
--DLINUX -DUNIX -D_FILE_OFFSET_BITS=64 -D__USE_LARGEFILE64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS"
-CXXFLAGS="-Wall -Wno-missing-braces -Wno-unknown-pragmas -Wno-unused \
--DLINUX -DUNIX -D_FILE_OFFSET_BITS=64 -D__USE_LARGEFILE64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS \
+PLATFORM_DEFINES="-DUNIX -D_FILE_OFFSET_BITS=64 -D__USE_LARGEFILE64 -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS"
+if [ $DARWIN -eq 0 ]; then
+    PLATFORM_DEFINES="-DLINUX ${PLATFORM_DEFINES}"
+fi
+CFLAGS="-Wall -Wno-missing-braces -Wno-unknown-pragmas -Wno-unused ${PLATFORM_DEFINES}"
+CXXFLAGS="-Wall -Wno-missing-braces -Wno-unknown-pragmas -Wno-unused ${PLATFORM_DEFINES} \
 -I${SRCDIR} -I${SRCDIR}/app \
 "
-LDFLAGS="-L. -ldl -lm -lstdc++ -lstdc++fs"
+if [ $DARWIN -ne 0 ]; then
+    LDFLAGS="-L. -lm -liconv"
+else
+    LDFLAGS="-L. -ldl -lm -lstdc++ -lstdc++fs"
+fi
 if [ $ARM64 -ne 0 ]; then
     CXXINC="${CXXINC} -DLINUX64"
 elif [ $X86_64 -ne 0 ]; then
@@ -318,7 +331,9 @@ else
     if cxx_check "-fomit-frame-pointer" "${CXXFLAGS} -fomit-frame-pointer ${LDFLAGS}" ; then
         CXXFLAGS="$CXXFLAGS -fomit-frame-pointer"
     fi
-    LDFLAGS="$LDFLAGS -Wl,-s"
+    if [ $DARWIN -eq 0 ]; then
+        LDFLAGS="$LDFLAGS -Wl,-s"
+    fi
 
 	if [ $ENABLE_LTO -ne 0 ]; then
 		CXXFLAGS="$CXXFLAGS -flto"
@@ -492,7 +507,7 @@ write_enc_config "#define ENABLE_LIBASS_SUBBURN         $ENABLE_LIBASS"
 write_enc_config "#define ENABLE_ADVANCED_DEINTERLACE   0"
 write_enc_config "#define ENABLE_MVC_ENCODING           0"
 write_enc_config "#define ENABLE_FPS_CONVERSION         0"
-write_enc_config "#define ENABLE_OPENCL                 1"
+write_enc_config "#define ENABLE_OPENCL                 $ENABLE_OPENCL"
 write_enc_config "#define ENABLE_SESSION_THREAD_CONFIG  0"
 write_enc_config "#define ENABLE_AVCODEC_OUT_THREAD     1"
 write_enc_config "#define AV_CHANNEL_LAYOUT_STRUCT_AVAIL $AV_CHANNEL_LAYOUT_STRUCT_AVAIL"
@@ -502,5 +517,3 @@ write_enc_config "#define ENABLE_CPP_REGEX              $ENABLE_CPP_REGEX"
 write_enc_config "#define ENABLE_DTL                    $ENABLE_DTL"
 
 cnf_write "successfully generated config.mak, rgy_config.h"
-
-
