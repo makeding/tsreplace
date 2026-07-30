@@ -1093,6 +1093,7 @@ RGY_ERR TSReplace::close() {
     }
     AddMessage(RGY_LOG_DEBUG, _T("Close ts input queue.\n"));
     m_queueInputReplace.reset();
+    m_queueInputPreAnalysis.reset();
 
     if (m_encoder) {
         sts = (RGY_ERR)m_encoder->waitAndGetExitCode();
@@ -1299,7 +1300,7 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
         m_queueInputReplace->setMaxCapacity(m_fileTSBufSize);
         AddMessage(RGY_LOG_DEBUG, _T("Create queue for input (replace).\n"));
     }
-    if (!m_queueInputPreAnalysis && !m_preAnalysisFin) {
+    if (!m_queueInputPreAnalysis && !m_preAnalysisFin.load()) {
         m_queueInputPreAnalysis = std::make_unique<RGYQueueBuffer>();
         m_queueInputPreAnalysis->init(m_fileTSBufSize);
         m_queueInputPreAnalysis->setMaxCapacity(m_fileTSBufSize);
@@ -1310,30 +1311,36 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
         m_threadInputTS = std::make_unique<std::thread>([&]() {
             std::vector<uint8_t> readBuffer(m_fileTSBufSize);
             size_t bytes_read = 0;
+            uint64_t totalBytesRead = 0;
             while (!m_inputAbort && (bytes_read = _fread_nolock(readBuffer.data(), 1, readBuffer.size(), m_fpTSIn.get())) != 0) {
-                // 事前解析が終わったらキューを破棄してこれ以上転送しないようにする
-                if (m_queueInputPreAnalysis && m_preAnalysisFin) {
-                    m_queueInputPreAnalysis.reset();
-                    AddMessage(RGY_LOG_DEBUG, _T("Queue for input (preanalysis) deleted.\n"));
-                }
-
+                totalBytesRead += bytes_read;
                 struct QueueInfo {
                     bool sent;
                     RGYQueueBuffer *queue;
                     const TCHAR *queueName;
+                    bool preAnalysis;
                 };
 
                 // キューのリストを作成する
                 // キューの構成は途中で変化しうるので、毎回作成する
                 std::vector<QueueInfo> queues;
-                if (m_queueInputEncoder)     queues.push_back({ false, m_queueInputEncoder.get(),     _T("encoder")     });
-                if (m_queueInputReplace)     queues.push_back({ false, m_queueInputReplace.get(),     _T("replace")     });
-                if (m_queueInputPreAnalysis) queues.push_back({ false, m_queueInputPreAnalysis.get(), _T("preanalysis") });
+                if (m_queueInputEncoder)     queues.push_back({ false, m_queueInputEncoder.get(),     _T("encoder"),     false });
+                if (m_queueInputReplace)     queues.push_back({ false, m_queueInputReplace.get(),     _T("replace"),     false });
+                if (m_queueInputPreAnalysis && !m_preAnalysisFin.load()) {
+                    queues.push_back({ false, m_queueInputPreAnalysis.get(), _T("preanalysis"), true });
+                }
 
                 // すべてのキューに対してデータを送信できるまでループ
                 for (size_t queueSent = 0; !m_inputAbort && queueSent < queues.size(); ) {
                     bool emptyQueueExists = false;
                     for (auto& queue : queues) {
+                        if (queue.preAnalysis && m_preAnalysisFin.load()) {
+                            if (!queue.sent) {
+                                queue.sent = true;
+                                queueSent++;
+                            }
+                            continue;
+                        }
                         if (queue.sent) {
                             emptyQueueExists |= queue.queue->size() == 0;
                             continue;
@@ -1354,7 +1361,7 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
                     }
                 }
             }
-            AddMessage(RGY_LOG_DEBUG, _T("Reached input ts EOF.\n"));
+            AddMessage(RGY_LOG_DEBUG, _T("Reached input ts EOF after %llu bytes.\n"), (unsigned long long)totalBytesRead);
             if (m_queueInputEncoder) m_queueInputEncoder->setEOF();
             if (m_queueInputReplace) m_queueInputReplace->setEOF();
             if (m_queueInputPreAnalysis) m_queueInputPreAnalysis->setEOF();
@@ -1398,7 +1405,7 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
             return RGY_ERR_NONE;
         }
     }
-    AddMessage(RGY_LOG_DEBUG, _T("Reached input ts EOF (main thread).\n"));
+    AddMessage(RGY_LOG_DEBUG, _T("Reached input ts EOF (main thread, consumed %lld bytes).\n"), (long long)m_tsPktSplitter->pos());
     return RGY_ERR_MORE_DATA;
 }
 
@@ -1920,15 +1927,24 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
             if (err != RGY_ERR_NONE) {
                 return err;
             }
-            const auto packet_type = std::get<1>(parsed_ret).type;
+            const auto& result = std::get<1>(parsed_ret);
+            const auto packet_type = result.type;
             switch (packet_type) {
             case RGYTSPacketType::PAT:
                 pat = m_demuxer->pat();
                 break;
             case RGYTSPacketType::PMT:
-                service = m_demuxer->service();
+                if (result.programNumber > 0 && result.psi && result.psi->version_number) {
+                    const auto parsedService = m_demuxer->service();
+                    if (parsedService && parsedService->programNumber > 0 && parsedService->vid.stream.pid > 0) {
+                        service = parsedService;
+                    }
+                }
                 break;
             default:
+                break;
+            }
+            if (pat && service) {
                 break;
             }
         }
@@ -1979,8 +1995,8 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
     // 出力開始点の計算 (最初に時刻を取得できたパケット + replace-delay)
     m_outputStartTimestamp = m_vidFirstPacketPTS + m_replaceDelay;
     // 読み込み側に解析の終了を通知
-    m_preAnalysisFin = true;
     originalTS.reset();
+    m_preAnalysisFin.store(true);
 
     AddMessage(RGY_LOG_INFO, _T("%s First packet PTS: %11lld [%+7.1f ms] [%+7.1f ms]\n"),
         (m_startPoint == TSRReplaceStartPoint::FirstPacket) ? _T("*") : _T(" "),

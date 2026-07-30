@@ -406,15 +406,15 @@ public:
         m_capacity = bufSize;
     }
     int64_t size() const {
-        return m_size;
+        return m_size.load();
     }
     bool empty() const {
-        return m_size == 0;
+        return m_size.load() == 0;
     }
     bool pushData(const uint8_t *data, int64_t addSize, int timeout) {
         //最初に決めた容量分までキューにデータがたまっていたら、キューに空きができるまで待機する
         int wait = 0;
-        while (m_size >= m_maxCapacity) {
+        while (m_size.load() >= m_maxCapacity) {
             ResetEvent(m_heEventPoped);
             const int wait_time = 16;
             WaitForSingleObject(m_heEventPoped, wait_time);
@@ -424,23 +424,24 @@ public:
             }
         }
         std::lock_guard<std::mutex> lock(m_mutex);
-        if (m_size + addSize > m_capacity) {
-            m_capacity = (std::max)(m_capacity * 2, m_size + addSize);
+        const auto currentSize = m_size.load();
+        if (currentSize + addSize > m_capacity) {
+            m_capacity = (std::max)(m_capacity * 2, currentSize + addSize);
             auto tmp = (uint8_t *)malloc((size_t)m_capacity);
-            if (m_size > 0) {
-                memcpy(tmp, m_ptr + m_offset, (size_t)m_size);
+            if (currentSize > 0) {
+                memcpy(tmp, m_ptr + m_offset, (size_t)currentSize);
             }
             free(m_ptr);
             m_ptr = tmp;
             m_offset = 0;
-        } else if (m_size + m_offset + addSize > m_capacity) {
-            if (m_size > 0) {
-                memmove(m_ptr, m_ptr + m_offset, (size_t)m_size);
+        } else if (currentSize + m_offset + addSize > m_capacity) {
+            if (currentSize > 0) {
+                memmove(m_ptr, m_ptr + m_offset, (size_t)currentSize);
             }
             m_offset = 0;
         }
-        memcpy(m_ptr + m_offset + m_size, data, (size_t)addSize);
-        m_size += addSize;
+        memcpy(m_ptr + m_offset + currentSize, data, (size_t)addSize);
+        m_size.store(currentSize + addSize);
         SetEvent(m_heEventPushed);
         return true;
     }
@@ -453,7 +454,8 @@ public:
         return copy_size;
     }
     void setEOF() {
-        m_EOF = true;
+        m_EOF.store(true);
+        SetEvent(m_heEventPushed);
     }
     void setMaxCapacity(int64_t maxCapacity) {
         m_maxCapacity = maxCapacity;
@@ -463,14 +465,14 @@ public:
     }
 protected:
     int64_t popData(uint8_t *data, const int64_t maxSize) {
-        if (m_size == 0) return (m_EOF) ? -1 : 0;
-
         std::lock_guard<std::mutex> lock(m_mutex);
-        int64_t copy_size = (std::min)(maxSize, m_size);
+        const auto currentSize = m_size.load();
+        if (currentSize == 0) return (m_EOF.load()) ? -1 : 0;
+        int64_t copy_size = (std::min)(maxSize, currentSize);
         memcpy(data, m_ptr + m_offset, (size_t)copy_size);
         m_offset += copy_size;
-        m_size -= copy_size;
-        if (m_size == 0) {
+        m_size.store(currentSize - copy_size);
+        if (currentSize == copy_size) {
             m_offset = 0;
         }
         SetEvent(m_heEventPoped);
@@ -478,13 +480,13 @@ protected:
         return copy_size;
     }
     uint8_t *m_ptr;
-    int64_t m_size;
+    std::atomic<int64_t> m_size;
     int64_t m_capacity;
     int64_t m_maxCapacity;
     int64_t m_offset;
     HANDLE m_heEventPoped; //キューからデータを取り出したときセットする
     HANDLE m_heEventPushed; //キューにデータが追加されたときセットする
-    bool m_EOF;
+    std::atomic<bool> m_EOF;
     std::mutex m_mutex;
 };
 

@@ -417,16 +417,17 @@ RGYTSPESHeader RGYTSDemuxer::parsePESHeader(const std::vector<uint8_t>& pkt) {
     pes.dts = TIMESTAMP_INVALID_VALUE;
     static uint8_t PES_START_CODE[3] = { 0x00, 0x00, 0x01 };
     const uint8_t *pes_header = nullptr;
-    for (int i = 4; i < (int)pkt.size(); i++) {
+    for (size_t i = 4; i + sizeof(PES_START_CODE) <= pkt.size(); i++) {
         if (memcmp(pkt.data() + i, PES_START_CODE, sizeof(PES_START_CODE)) == 0) {
             pes_header = pkt.data() + i;
             break;
         }
     }
-    if (!pes_header) {
+    if (!pes_header || (size_t)(pkt.data() + pkt.size() - pes_header) < PES_HEADER_SIZE) {
         return pes;
     }
     const uint8_t *ptr = pes_header;
+    const size_t available = pkt.data() + pkt.size() - pes_header;
     pes.stream_id = ptr[3];
     pes.pes_len = read16(ptr + 4);
     if ((ptr[6] & 0xC0) == (0x80)) {
@@ -444,24 +445,39 @@ RGYTSPESHeader RGYTSDemuxer::parsePESHeader(const std::vector<uint8_t>& pkt) {
         pes.crc_flag                  = (ptr[7] & 0x02) != 0;
         pes.ext_flag                  = (ptr[7] & 0x01) != 0;
         pes.pes_header_len            =  ptr[8];
+        const auto headerSize = std::min(available, (size_t)PES_HEADER_SIZE + pes.pes_header_len);
+        const uint8_t *headerEnd = pes_header + headerSize;
         ptr += 9;
         if (pes.pts_flag) {
+            if (headerEnd - ptr < 5) {
+                return pes;
+            }
             pes.pts = parsePESPTS(ptr);
             ptr += 5;
         }
         if (pes.dts_flag) {
+            if (headerEnd - ptr < 5) {
+                pes.dts = TIMESTAMP_INVALID_VALUE;
+                return pes;
+            }
             pes.dts = parsePESPTS(ptr);
             ptr += 5;
         } else {
             pes.dts = pes.pts;
         }
         if (pes.ext_flag) {
+            if (ptr >= headerEnd) {
+                return pes;
+            }
             auto pes_ext = *ptr++;
             int skip = (pes_ext >> 4) & 0x0B;
             skip += skip & 0x09;
+            if (headerEnd - ptr < skip) {
+                return pes;
+            }
             ptr += skip;
             if ((pes_ext & 0x41) == 0x01 &&
-                (ptr + 2) <= (pes_header + pes.pes_header_len + PES_HEADER_SIZE)) {
+                headerEnd - ptr >= 2) {
                 /* PES extension 2 */
                 if ((ptr[0] & 0x7f) > 0 && (ptr[1] & 0x80) == 0) {
                     pes.extended_stream_id = ptr[1];
@@ -606,8 +622,10 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
 
     // PAT
     if (packetHeader.PID == 0x00) {
-        m_pat = parsePAT(pkt->payload(), packetHeader.payloadSize, packetHeader.PayloadStartFlag, packetHeader.Counter);
-        checkPMTList();
+        if (auto pat = parsePAT(pkt->payload(), packetHeader.payloadSize, packetHeader.PayloadStartFlag, packetHeader.Counter); pat) {
+            m_pat = std::move(pat);
+            checkPMTList();
+        }
         result.type = RGYTSPacketType::PAT;
         return { RGY_ERR_NONE, std::move(result) };
     }
@@ -615,7 +633,8 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
     if (m_pat) {
         const RGYTS_PMT_PID *pmt_pid = nullptr;
         for (const auto& pmt : m_pat->pmt) {
-            if (packetHeader.PID == pmt.pmt_pid) {
+            // program_number == 0 points to a network PID (NIT), not a PMT.
+            if (pmt.program_number != 0 && packetHeader.PID == pmt.pmt_pid) {
                 pmt_pid = &pmt;
                 break;
             }
@@ -805,11 +824,17 @@ std::tuple<RGY_ERR, std::vector<uniqueRGYTSPacket>> RGYTSPacketSplitter::split(v
         if (offset < 0) {
             return { RGY_ERR_NONE, std::move(packets) };
         }
+        const auto bytesToConsume = (size_t)offset + m_packetSize;
+        if (m_readBuf.size() < bytesToConsume) {
+            // A sync byte was found near the end of the current chunk, but the
+            // complete packet has not arrived yet.
+            return { RGY_ERR_NONE, std::move(packets) };
+        }
 
         auto pkt = m_packetContainer.getEmpty();
-        pkt->packet.resize(m_packetSize);
-        memcpy(pkt->packet.data(), m_readBuf.data() + offset, m_packetSize);
-        m_readBuf.removeData(m_packetSize);
+        pkt->packet.resize(188);
+        memcpy(pkt->packet.data(), m_readBuf.data() + offset, pkt->packet.size());
+        m_readBuf.removeData(bytesToConsume);
 
         pkt->header = parsePacketHeader(pkt->packet.data(), m_readBuf.pos());
         if (pkt->header.Sync != TS_SYNC_BYTE) {

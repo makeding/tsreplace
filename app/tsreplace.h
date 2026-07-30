@@ -34,6 +34,7 @@
 #include <set>
 #include <thread>
 #include <mutex>
+#include <atomic>
 #include "rgy_tsdemux.h"
 #include "rgy_avutil.h"
 #include "rgy_pipe.h"
@@ -306,14 +307,14 @@ protected:
     std::unique_ptr<RGYTSPacketSplitter> m_tsPktSplitter; // ts読み込み時ののpacket分割用
     std::unique_ptr<FILE, fp_deleter> m_fpTSIn;  // 入力tsファイル
     std::unique_ptr<FILE, fp_deleter> m_fpTSOut; // 出力tsファイル
-    bool m_inputAbort; // 入力スレッドの終了要求
+    std::atomic<bool> m_inputAbort; // 入力スレッドの終了要求
     std::unique_ptr<std::thread> m_threadInputTS; // オリジナルts読み込みスレッド
     std::unique_ptr<std::thread> m_threadSendEncoder; // tsからエンコーダへの送信スレッド
     std::unique_ptr<RGYQueueBuffer> m_queueInputReplace; // tsreplaceの読み込み用
     std::unique_ptr<RGYQueueBuffer> m_queueInputEncoder; // エンコーダの読み込み用
     std::unique_ptr<RGYQueueBuffer> m_queueInputPreAnalysis; // 事前解析読み込み用
     std::vector<uint8_t> m_bufferTS; // 読み込みtsのファイルバッファ
-    bool m_preAnalysisFin; // 事前解析の終了
+    std::atomic<bool> m_preAnalysisFin; // 事前解析の終了
     uint16_t m_vidPIDReplace;   // 出力tsの動画のPID上書き用
     uint16_t m_pcrPIDReplace;   // 出力tsのPCRのPID上書き用
     int64_t m_vidDTSOutMax;     // 動画フレームのDTS最大値(出力制御用)
