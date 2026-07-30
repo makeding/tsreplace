@@ -4,13 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -18,6 +22,28 @@ DEFAULT_EXTENSIONS = (".m2ts", ".ts")
 DEFAULT_PROTECTED_KEYWORDS = ("紅白歌合戦", "開票速報")
 EIT_PID = 0x0012
 EIT_PRESENT_FOLLOWING_ACTUAL_TABLE_ID = 0x4E
+JST = timezone(timedelta(hours=9))
+REPORT_COLUMNS = (
+    "file_name",
+    "source_path",
+    "output_path",
+    "status",
+    "program_start",
+    "program_end",
+    "program_duration",
+    "program_name",
+    "service_id",
+    "event_id",
+    "process_started_at",
+    "process_finished_at",
+    "process_duration_seconds",
+    "original_size",
+    "trimmed_size",
+    "saved_bytes",
+    "saved_percent",
+    "services",
+    "message",
+)
 
 
 @dataclass(frozen=True)
@@ -39,6 +65,17 @@ class TrimResult:
     output: Path
     original_size: int
     trimmed_size: int
+    services: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class ProgramInfo:
+    name: str = ""
+    start: str = ""
+    end: str = ""
+    duration: str = ""
+    service_id: str = ""
+    event_id: str = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,6 +110,11 @@ def parse_args() -> argparse.Namespace:
         "--tscharset",
         default="tscharset",
         help="TSDuck tscharset executable (default: tscharset from PATH)",
+    )
+    parser.add_argument(
+        "--tstables",
+        default="tstables",
+        help="TSDuck tstables executable (default: tstables from PATH)",
     )
     parser.add_argument(
         "--protect-keyword",
@@ -116,6 +158,19 @@ def parse_args() -> argparse.Namespace:
         "--dry-run",
         action="store_true",
         help="list files and commands without changing anything",
+    )
+    parser.add_argument(
+        "--report",
+        type=Path,
+        help=(
+            "append a TSV report to this file "
+            "(default: <directory>/tsreplace-trim-report.tsv)"
+        ),
+    )
+    parser.add_argument(
+        "--no-report",
+        action="store_true",
+        help="do not create or append the TSV report",
     )
     return parser.parse_args()
 
@@ -177,6 +232,188 @@ def check_tsanalyze(tsanalyze: str) -> str:
             + (f":\n{detail}" if detail else "")
         )
     return (result.stdout or result.stderr).strip().splitlines()[0]
+
+
+def recording_hint_from_filename(path: Path) -> tuple[datetime | None, int | None]:
+    match = re.match(r"^(\d{8})-(\d+)-(\d{6})(?:[-_]|$)", path.name)
+    if match is None:
+        return None, None
+    try:
+        started = datetime.strptime(match.group(1) + match.group(3), "%Y%m%d%H%M%S")
+    except ValueError:
+        started = None
+    return (started.replace(tzinfo=JST) if started is not None else None), int(
+        match.group(2)
+    )
+
+
+def named_nodes(node: object, name: str) -> list[dict[str, object]]:
+    if not isinstance(node, dict):
+        return []
+    return [
+        child
+        for child in node.get("#nodes", [])
+        if isinstance(child, dict) and child.get("#name") == name
+    ]
+
+
+def text_from_node(node: dict[str, object]) -> str:
+    return "".join(item for item in node.get("#nodes", []) if isinstance(item, str))
+
+
+def parse_duration(value: str) -> timedelta | None:
+    try:
+        hours, minutes, seconds = (int(part) for part in value.split(":"))
+    except (TypeError, ValueError):
+        return None
+    return timedelta(hours=hours, minutes=minutes, seconds=seconds)
+
+
+def extract_program_info(path: Path, tstables: str) -> ProgramInfo:
+    recording_start, expected_service_id = recording_hint_from_filename(path)
+    command = [
+        tstables,
+        "--japan",
+        "--pid",
+        str(EIT_PID),
+        "--tid",
+        hex(EIT_PRESENT_FOLLOWING_ACTUAL_TABLE_ID),
+    ]
+    if expected_service_id is not None:
+        command.extend(("--tid-ext", str(expected_service_id)))
+    command.extend(("--max-tables", "1", "--json-output", "-", str(path)))
+    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"tstables failed with exit code {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    try:
+        tables = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"tstables returned invalid JSON: {error}") from error
+
+    candidates: list[tuple[datetime, datetime, ProgramInfo]] = []
+    for table in tables if isinstance(tables, list) else []:
+        if not isinstance(table, dict) or table.get("#name") != "EIT":
+            continue
+        service_id = table.get("service_id", "")
+        for event in named_nodes(table, "event"):
+            start_text = str(event.get("start_time", ""))
+            duration_text = str(event.get("duration", ""))
+            try:
+                start = datetime.strptime(start_text, "%Y-%m-%d %H:%M:%S").replace(
+                    tzinfo=JST
+                )
+            except ValueError:
+                continue
+            duration = parse_duration(duration_text)
+            if duration is None:
+                continue
+            name = ""
+            descriptors = named_nodes(event, "short_event_descriptor")
+            if descriptors:
+                names = named_nodes(descriptors[0], "event_name")
+                if names:
+                    name = text_from_node(names[0])
+            end = start + duration
+            info = ProgramInfo(
+                name=name,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                duration=duration_text,
+                service_id=str(service_id),
+                event_id=str(event.get("event_id", "")),
+            )
+            candidates.append((start, end, info))
+
+    if not candidates:
+        return ProgramInfo(service_id=str(expected_service_id or ""))
+    if recording_start is None:
+        return candidates[0][2]
+    containing = [item for item in candidates if item[0] <= recording_start < item[1]]
+    if containing:
+        return containing[0][2]
+    return min(candidates, key=lambda item: abs(item[0] - recording_start))[2]
+
+
+def append_report(path: Path, row: dict[str, object]) -> None:
+    needs_header = not path.exists() or path.stat().st_size == 0
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=REPORT_COLUMNS,
+            delimiter="\t",
+            lineterminator="\n",
+            extrasaction="ignore",
+        )
+        if needs_header:
+            writer.writeheader()
+        writer.writerow(row)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def initialize_report(path: Path) -> None:
+    if not path.parent.is_dir():
+        raise NotADirectoryError(path.parent)
+    if path.exists() and path.stat().st_size > 0:
+        with path.open("r", encoding="utf-8", newline="") as stream:
+            header = stream.readline().rstrip("\r\n").split("\t")
+        if tuple(header) != REPORT_COLUMNS:
+            raise RuntimeError(f"report has an incompatible TSV header: {path}")
+        return
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(
+            stream,
+            fieldnames=REPORT_COLUMNS,
+            delimiter="\t",
+            lineterminator="\n",
+        )
+        writer.writeheader()
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def report_values(
+    source: Path,
+    output: Path | None,
+    status: str,
+    program: ProgramInfo,
+    process_started_at: datetime,
+    process_finished_at: datetime,
+    process_seconds: float,
+    original_size: int,
+    trimmed_size: int | None,
+    services: tuple[str, ...] = (),
+    message: str = "",
+) -> dict[str, object]:
+    saved = original_size - trimmed_size if trimmed_size is not None else ""
+    percent: float | str = ""
+    if trimmed_size is not None and original_size:
+        percent = f"{(original_size - trimmed_size) * 100.0 / original_size:.2f}"
+    return {
+        "file_name": source.name,
+        "source_path": source,
+        "output_path": output or "",
+        "status": status,
+        "program_start": program.start,
+        "program_end": program.end,
+        "program_duration": program.duration,
+        "program_name": program.name,
+        "service_id": program.service_id,
+        "event_id": program.event_id,
+        "process_started_at": process_started_at.isoformat(timespec="seconds"),
+        "process_finished_at": process_finished_at.isoformat(timespec="seconds"),
+        "process_duration_seconds": f"{process_seconds:.3f}",
+        "original_size": original_size,
+        "trimmed_size": "" if trimmed_size is None else trimmed_size,
+        "saved_bytes": saved,
+        "saved_percent": percent,
+        "services": ",".join(services),
+        "message": message,
+    }
 
 
 def encode_arib_keywords(tscharset: str, keywords: list[str]) -> dict[str, bytes]:
@@ -407,9 +644,10 @@ def trim_one(
     backup_suffix: str | None,
     no_replace: bool,
     protected_patterns: dict[str, bytes],
+    program_info: ProgramInfo,
     dry_run: bool,
     remove_failed_processing: bool,
-) -> TrimResult | None:
+) -> TrimResult | str | None:
     processing = source.with_name(source.name + processing_suffix)
     output = source.with_name(f"{source.stem}-trimed{source.suffix}") if no_replace else source
     command = [
@@ -422,6 +660,8 @@ def trim_one(
     ]
 
     print(f"\n[{source}]")
+    if program_info.name:
+        print(f"  program:  {program_info.start} {program_info.name}")
     print(f"  trim:     {command_text(command)}")
     print(f"  temporary:{processing}")
     if no_replace:
@@ -439,7 +679,7 @@ def trim_one(
         protected_keyword = find_protected_keyword(source, protected_patterns)
         if protected_keyword is not None:
             print(f"  skipped:  protected EIT keyword {protected_keyword!r}")
-            return None
+            return protected_keyword
     free, required = check_available_space(source, before.size)
     print(f"  free space: {free} bytes (required: {required} bytes)")
     if dry_run:
@@ -465,7 +705,7 @@ def trim_one(
             f"({before.size} -> {trimmed_size} bytes, "
             f"saved {saved} bytes, {percent:.2f}%)"
         )
-        return TrimResult(source, output, before.size, trimmed_size)
+        return TrimResult(source, output, before.size, trimmed_size, tuple(services))
     except BaseException:
         if remove_failed_processing:
             processing.unlink(missing_ok=True)
@@ -487,6 +727,16 @@ def main() -> int:
         raise ValueError("--backup-suffix must not be empty")
     if args.no_replace and args.backup_suffix is not None:
         raise ValueError("--no-replace and --backup-suffix cannot be used together")
+    if args.no_report and args.report is not None:
+        raise ValueError("--report and --no-report cannot be used together")
+
+    report_path: Path | None = None
+    if not args.no_report:
+        report_path = (
+            args.report.expanduser().resolve()
+            if args.report is not None
+            else directory / "tsreplace-trim-report.tsv"
+        )
 
     extensions = parse_extensions(args.extensions)
     protected_keywords = [] if args.no_protect_keywords else [
@@ -496,31 +746,49 @@ def main() -> int:
     sources = find_files(directory, extensions, args.recursive)
     print(f"directory: {directory}")
     print(f"files:     {len(sources)}")
+    if report_path is not None:
+        print(f"report:    {report_path}{' (not written by dry-run)' if args.dry_run else ''}")
     if not sources:
         return 0
 
     if args.dry_run:
         tsreplace = args.tsreplace
         tsanalyze = args.tsanalyze
+        tstables = args.tstables
         protected_patterns: dict[str, bytes] = {}
     else:
         tsreplace = resolve_executable(args.tsreplace, "tsreplace")
         tsanalyze = resolve_executable(args.tsanalyze, "tsanalyze")
+        tstables = resolve_executable(args.tstables, "tstables")
         tsanalyze_version = check_tsanalyze(tsanalyze)
         print(f"tsreplace: {tsreplace}")
         print(f"tsanalyze: {tsanalyze} ({tsanalyze_version})")
+        print(f"tstables:  {tstables}")
         protected_patterns = {}
         if protected_keywords:
             tscharset = resolve_executable(args.tscharset, "tscharset")
             protected_patterns = encode_arib_keywords(tscharset, protected_keywords)
             print(f"tscharset: {tscharset}")
             print(f"protected: {', '.join(protected_patterns)}")
+        if report_path is not None:
+            initialize_report(report_path)
 
     succeeded: list[TrimResult] = []
     skipped = 0
     failed: list[tuple[Path, str]] = []
     for source in sources:
+        process_started_at = datetime.now().astimezone()
+        process_started = time.monotonic()
+        original_size = source.stat().st_size
+        program_info = ProgramInfo()
+        metadata_message = ""
         try:
+            if not args.dry_run and report_path is not None:
+                try:
+                    program_info = extract_program_info(source, tstables)
+                except Exception as error:
+                    metadata_message = f"EIT metadata unavailable: {error}"
+                    print(f"\n[{source}]\n  warning:  {metadata_message}")
             result = trim_one(
                 source=source,
                 tsreplace=tsreplace,
@@ -529,16 +797,75 @@ def main() -> int:
                 backup_suffix=args.backup_suffix,
                 no_replace=args.no_replace,
                 protected_patterns=protected_patterns,
+                program_info=program_info,
                 dry_run=args.dry_run,
                 remove_failed_processing=args.remove_failed_processing,
             )
-            if result is not None:
+            if isinstance(result, TrimResult):
                 succeeded.append(result)
-            elif not args.dry_run:
+                if report_path is not None:
+                    finished = datetime.now().astimezone()
+                    append_report(
+                        report_path,
+                        report_values(
+                            source,
+                            result.output,
+                            "ok",
+                            program_info,
+                            process_started_at,
+                            finished,
+                            time.monotonic() - process_started,
+                            result.original_size,
+                            result.trimmed_size,
+                            result.services,
+                            metadata_message,
+                        ),
+                    )
+            elif isinstance(result, str):
                 skipped += 1
+                if report_path is not None:
+                    finished = datetime.now().astimezone()
+                    message = f"protected EIT keyword: {result}"
+                    if metadata_message:
+                        message = f"{metadata_message}; {message}"
+                    append_report(
+                        report_path,
+                        report_values(
+                            source,
+                            None,
+                            "skipped_protected",
+                            program_info,
+                            process_started_at,
+                            finished,
+                            time.monotonic() - process_started,
+                            original_size,
+                            original_size,
+                            message=message,
+                        ),
+                    )
         except Exception as error:
             failed.append((source, str(error)))
             print(f"  FAILED: {error}", file=sys.stderr)
+            if report_path is not None and not args.dry_run:
+                finished = datetime.now().astimezone()
+                message = str(error)
+                if metadata_message:
+                    message = f"{metadata_message}; {message}"
+                append_report(
+                    report_path,
+                    report_values(
+                        source,
+                        None,
+                        "failed",
+                        program_info,
+                        process_started_at,
+                        finished,
+                        time.monotonic() - process_started,
+                        original_size,
+                        None,
+                        message=message,
+                    ),
+                )
             if args.fail_fast:
                 break
 
