@@ -251,6 +251,7 @@ protected:
     RGY_ERR readTS(std::vector<uniqueRGYTSPacket>& packetBuffer);
     RGY_ERR writePacket(const RGYTSPacket *pkt);
     RGY_ERR writeTypeDPacket(RGYTSPacket *pkt);
+    bool shouldDropTypeDPacket(const RGYTSPacket *pkt, bool removeTypeD);
     void markTypeDPacketRemoved(const RGYTSPacket *pkt);
     RGY_ERR writeReplacedPCR(const uint64_t pcr);
     RGY_ERR writeReplacedPAT(const RGYTS_PAT *pat);
@@ -340,6 +341,8 @@ protected:
     bool m_typeDStatsLogged;
     std::map<int, uint8_t> m_typeDOutputCounters; // PIDごとの直前の出力continuity_counter
     std::set<int> m_typeDRewriteCounters; // パケット削除後にcontinuity_counterを書き換えるPID
+    std::set<int> m_smartPersistentTypeDPids; // smart trim中も常時保持するエントリコンポーネントPID
+    std::set<int> m_typeDWaitForPayloadStart; // trim後の再開時にPUSIを待つPID
     bool m_removeNonTargetService; // 非対象serviceの削除
     int m_selectService; // 出力するserviceの番号
     bool m_copyFileTs; // ファイルのタイムスタンプをコピー

@@ -1026,6 +1026,8 @@ TSReplace::TSReplace() :
     m_typeDStatsLogged(false),
     m_typeDOutputCounters(),
     m_typeDRewriteCounters(),
+    m_smartPersistentTypeDPids(),
+    m_typeDWaitForPayloadStart(),
     m_removeNonTargetService(true),
     m_selectService(0),
     m_copyFileTs(false),
@@ -1413,6 +1415,28 @@ void TSReplace::markTypeDPacketRemoved(const RGYTSPacket *pkt) {
     }
 }
 
+bool TSReplace::shouldDropTypeDPacket(const RGYTSPacket *pkt, bool removeTypeD) {
+    const auto pid = pkt->header.PID;
+    if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart
+        && m_smartPersistentTypeDPids.count(pid) > 0) {
+        return false;
+    }
+    if (removeTypeD) {
+        if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart) {
+            m_typeDWaitForPayloadStart.insert(pid);
+        }
+        return true;
+    }
+    if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart
+        && m_typeDWaitForPayloadStart.count(pid) > 0) {
+        if (!pkt->header.PayloadStartFlag) {
+            return true;
+        }
+        m_typeDWaitForPayloadStart.erase(pid);
+    }
+    return false;
+}
+
 RGY_ERR TSReplace::writeTypeDPacket(RGYTSPacket *pkt) {
     const auto pid = pkt->header.PID;
     const auto counter = pkt->header.Counter;
@@ -1551,7 +1575,31 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, 
         const auto streamType = (RGYTSStreamType)table[pos];
         const int esPid = ((table[pos + 1] & 0x1f) << 8) | table[pos + 2];
         const int esInfoLength = ((table[pos + 3] & 0x03) << 8) | table[pos + 4];
-        
+        if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart
+            && streamType == RGYTSStreamType::TYPE_D
+            && pos + 5 + esInfoLength <= tableLen) {
+            int componentTag = 0xff;
+            for (int descPos = pos + 5; descPos + 1 < pos + 5 + esInfoLength;) {
+                const int descriptorLength = table[descPos + 1];
+                if (descPos + 2 + descriptorLength > pos + 5 + esInfoLength) {
+                    break;
+                }
+                if (table[descPos] == (uint8_t)RGYTSDescriptor::StreamIdentifier
+                    && descriptorLength >= 1) {
+                    componentTag = table[descPos + 2];
+                    break;
+                }
+                descPos += 2 + descriptorLength;
+            }
+            // A/Bプロファイルは0x40、Cプロファイルは0x80がエントリコンポーネント。
+            if (componentTag == 0x40 || componentTag == 0x80) {
+                if (m_smartPersistentTypeDPids.insert(esPid).second) {
+                    AddMessage(RGY_LOG_INFO, _T("Smart Type-D persistent entry component: PID 0x%04x, component_tag 0x%02x.\n"),
+                        esPid, componentTag);
+                }
+            }
+        }
+
         if (replaceVideo && streamType == RGYTSStreamType::H262_VIDEO) {
             buf.push_back((uint8_t)m_videoReplace->getVideoStreamType());     // stream typeの上書き
             buf.push_back((uint8_t)((m_vidPIDReplace & 0x1fff) >> 8) | (table[pos + 1] & 0xE0)); // PIDの上書き
@@ -1562,7 +1610,9 @@ RGY_ERR TSReplace::writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, 
             buf.push_back(0x01);
             buf.push_back(0x00);
             modified = true;
-        } else if (removeTypeD && streamType == RGYTSStreamType::TYPE_D) {
+        } else if (removeTypeD
+            && m_removeTypeDMode == TSRRemoveTypeDMode::All
+            && streamType == RGYTSStreamType::TYPE_D) {
             // 出力しない
             modified = true;
         } else {
@@ -2304,10 +2354,14 @@ RGY_ERR TSReplace::restruct() {
                         }
                         break;
                     case RGYTSPacketType::OTHER:
-                        if (removeTypeD && ret.stream.type == RGYTSStreamType::TYPE_D) {
-                            markTypeDPacketRemoved(tspkt.get());
-                            m_removedTypeDPackets++;
-                            // データ放送の削除 -> 出力しない
+                        if (ret.stream.type == RGYTSStreamType::TYPE_D) {
+                            if (shouldDropTypeDPacket(tspkt.get(), removeTypeD)) {
+                                markTypeDPacketRemoved(tspkt.get());
+                                m_removedTypeDPackets++;
+                                // データ放送の削除 -> 出力しない
+                            } else {
+                                writeTypeDPacket(tspkt.get());
+                            }
                         } else {
                             bool outputPkt = true;
                             if (!m_trimOnly && m_replaceDelay > 0 && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
@@ -2323,11 +2377,7 @@ RGY_ERR TSReplace::restruct() {
                                 }
                             }
                             if (outputPkt) {
-                                if (ret.stream.type == RGYTSStreamType::TYPE_D) {
-                                    writeTypeDPacket(tspkt.get());
-                                } else {
-                                    writePacket(tspkt.get());
-                                }
+                                writePacket(tspkt.get());
                             }
                         }
                         break;
@@ -2340,14 +2390,16 @@ RGY_ERR TSReplace::restruct() {
                     if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
                         return err;
                     }
-                } else if (removeTypeD && ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
-                    markTypeDPacketRemoved(tspkt.get());
-                    m_removedTypeDPackets++;
-                    // データ放送の削除 -> 出力しない
                 } else if (m_removeNonTargetService && ret.programNumber > 0) {
                     // 対象サービスでない、他のサービスに属するパケットの場合(ret.programNumber > 0)、そのパケットは削除する -> 出力しない
                 } else if (ret.programNumber > 0 && ret.stream.type == RGYTSStreamType::TYPE_D) {
-                    writeTypeDPacket(tspkt.get());
+                    if (shouldDropTypeDPacket(tspkt.get(), removeTypeD)) {
+                        markTypeDPacketRemoved(tspkt.get());
+                        m_removedTypeDPackets++;
+                        // データ放送の削除 -> 出力しない
+                    } else {
+                        writeTypeDPacket(tspkt.get());
+                    }
                 } else {
                     writePacket(tspkt.get());
                 }
