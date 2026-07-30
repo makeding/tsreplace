@@ -246,6 +246,25 @@ timestampを保持できるコンテナ入りの映像を想定しており、ra
 
 `tsreplace -i - -o - --smart-remove-typed-duration 1800`
 
+ディレクトリ内の録画済みTSを一括処理する場合は、同梱のスクリプトを使用できます。
+各ファイルを同じディレクトリの `<元ファイル名>.processing` にtrimし、TSDuckの
+`tsanalyze`で188バイト境界とサービス情報を確認した後にのみ元ファイルを原子的に
+置き換えます。処理中に元ファイルが更新された場合や検証に失敗した場合、元ファイルは
+変更されません。処理を開始する前に`tsanalyze --version`が成功することを確認し、
+各ファイルについて元ファイルの2倍以上の空き容量が同じファイルシステムにある場合
+のみ処理します。また、EIT present/following (PID 0x0012) のARIB文字列に
+`紅白歌合戦` または `開票速報` が含まれるファイルは、変化するデータ放送を
+保存するため処理しません。追加の保護語は
+`--protect-keyword <文字列>`、この保護を無効にする場合は
+`--no-protect-keywords`を指定します。
+
+`./scripts/trim_directory.py .`
+
+サブディレクトリも対象にする場合は `--recursive`、元ファイルを `.original` として
+残す場合は `--backup-suffix .original`、元ファイルを置き換えずに
+`<元ファイル名>-trimed.ts` または `.m2ts` として出力する場合は `--no-replace`、
+実行内容だけ確認する場合は `--dry-run` を指定します。
+
 ### --log &lt;string&gt;
 ログを指定のファイルに出力します。
 
