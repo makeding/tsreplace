@@ -451,8 +451,17 @@ def completed_sources_from_report(
                 title = row.get("program_name", "").casefold()
                 if not any(keyword.casefold() in title for keyword in protected_keywords):
                     continue
-            if status == "skipped_channel" and not skip_channels_enabled:
-                continue
+            if status == "skipped_channel":
+                active_channel_names = (
+                    *DEFAULT_SKIPPED_NETWORKS.values(),
+                    *DEFAULT_SKIPPED_SERVICES.values(),
+                )
+                message = row.get("message", "")
+                if not skip_channels_enabled or not any(
+                    f"built-in channel skip: {name}" in message
+                    for name in active_channel_names
+                ):
+                    continue
             if status in {"skipped_small_savings", "unchanged"}:
                 try:
                     saved_bytes = int(row.get("saved_bytes", ""))
@@ -774,7 +783,11 @@ def main() -> int:
         if protected_keywords:
             print(f"protected titles: {', '.join(protected_keywords)}")
         if not args.no_skip_channels:
-            print("skipped channels: BS11, 110°CS Network 1/2")
+            skipped_channel_names = (
+                *DEFAULT_SKIPPED_NETWORKS.values(),
+                *DEFAULT_SKIPPED_SERVICES.values(),
+            )
+            print(f"skipped channels: {', '.join(skipped_channel_names)}")
         if report_path is not None:
             initialize_report(report_path)
 

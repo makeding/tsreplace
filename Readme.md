@@ -259,8 +259,10 @@ timestampを保持できるコンテナ入りの映像を想定しており、ra
 `--protect-keyword <文字列>`、この保護を無効にする場合は
 `--no-protect-keywords`を指定します。
 
-データ放送を持たないことが確認できたBS11（network ID 4 / service ID 211）と
+データ放送の削減効果がほぼないことを確認したBS11（network ID 4 / service ID 211）と
 110度CS（network ID 6、7）は、デフォルトでtrim自体を開始せずにスキップします。
+110度CSには契約案内などのデータ放送が含まれますが、サンプルでは全Type-Dを
+削除しても2.2 MiB程度しか減らず、バッチ処理の10 MiB閾値に届きませんでした。
 この内蔵リストを無効にする場合は `--no-skip-channels` を指定します。
 
 `./scripts/trim_directory.py .`
