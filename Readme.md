@@ -286,6 +286,32 @@ timestampを保持できるコンテナ入りの映像を想定しており、ra
 削減量が閾値未満だったファイルを、現在のファイルサイズも一致する場合にスキップします。
 失敗したファイルは完了扱いにせず、次回もう一度処理します。
 
+Hirakuのremote pipeを使って映像をFFmpegで転送・圧縮し、別のストレージへ
+保存する場合は、`--hiraku-address`、`--hiraku-secret`、`--output-directory`を
+指定します。`--hiraku-pipe`のデフォルトは`FFMPEG-X265`です。出力先では入力
+ディレクトリからの相対パスを維持し、`<ファイル名>.processing`へ書き込みます。
+元TSと処理後TSをTSDuckで走査し、188バイト境界とservice情報を確認します。さらに
+ffprobeでprogram ID、映像以外のstream構成、再生時間を比較した後、最終ファイル名へ
+変更し、元ファイルを同名の絶対symlinkへ原子的に置き換えます。処理・検証に失敗した
+場合は元ファイルを変更しません。
+
+```
+./scripts/trim_directory.py /mnt/recordings --recursive \
+  --output-directory /mnt/archive \
+  --hiraku-address 192.168.6.230:40773 \
+  --hiraku-secret 'your-secret' \
+  --hiraku-pipe FFMPEG-X265
+```
+
+remote transcode時は既存TSVを先に読みます。従来の`ok`、保護タイトル、内蔵
+チャンネルskip、削減量不足の記録が現在の元ファイルと一致する場合、Type-Dは
+処理済みまたは処理不要とみなし、`--smart-remove-typed`を再指定しません。ただし
+ファイル自体のtranscodeはskipしません。TSVに判断記録がないファイルだけ、remote
+transcodeとsmart Type-D trimを同時に実行します。remote transcode完了行は
+`transcoded`として追記され、次回以降の完了判定に使われます。純粋なtrimとして
+実行する場合は、従来どおり保護タイトルと対象外チャンネルをファイル単位でskip
+します。
+
 ### --log &lt;string&gt;
 ログを指定のファイルに出力します。
 

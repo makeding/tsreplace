@@ -18,7 +18,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-
 DEFAULT_EXTENSIONS = (".m2ts", ".ts")
 DEFAULT_PROTECTED_KEYWORDS = ("紅白歌合戦", "開票速報")
 DEFAULT_SKIPPED_NETWORKS = {
@@ -53,12 +52,14 @@ REPORT_COLUMNS = (
     "message",
 )
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1F\x7F-\x9F]")
+TRANSCODED_REPORT_STATUS = "transcoded"
 COMPLETED_REPORT_STATUSES = {
     "ok",
     "skipped_protected",
     "skipped_channel",
     "skipped_small_savings",
     "unchanged",
+    TRANSCODED_REPORT_STATUS,
 }
 
 
@@ -130,6 +131,11 @@ def parse_args() -> argparse.Namespace:
         help="TSDuck tstables executable (default: tstables from PATH)",
     )
     parser.add_argument(
+        "--ffprobe",
+        default="ffprobe",
+        help="ffprobe executable used for source/output comparison",
+    )
+    parser.add_argument(
         "--protect-keyword",
         action="append",
         default=[],
@@ -152,6 +158,32 @@ def parse_args() -> argparse.Namespace:
         "--processing-suffix",
         default=".processing",
         help="temporary output suffix (default: .processing)",
+    )
+    parser.add_argument(
+        "--output-directory",
+        type=Path,
+        help=(
+            "publish results below this directory, preserving paths relative to "
+            "the input directory, then replace each source with a symlink"
+        ),
+    )
+    parser.add_argument(
+        "--hiraku",
+        default="hiraku",
+        help="hiraku executable (default: hiraku from PATH)",
+    )
+    parser.add_argument(
+        "--hiraku-address",
+        help="enable remote transcoding through this hirakud host:port",
+    )
+    parser.add_argument(
+        "--hiraku-secret",
+        help="hirakud secret used with --hiraku-address",
+    )
+    parser.add_argument(
+        "--hiraku-pipe",
+        default="FFMPEG-X265",
+        help="remote hiraku pipe name (default: FFMPEG-X265)",
     )
     parser.add_argument(
         "--backup-suffix",
@@ -309,7 +341,13 @@ def extract_program_info(path: Path, tstables: str) -> ProgramInfo:
     if expected_service_id is not None:
         command.extend(("--tid-ext", str(expected_service_id)))
     command.extend(("--max-tables", "1", "--json-output", "-", str(path)))
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(
@@ -476,7 +514,7 @@ def completed_sources_from_report(
             candidate_text = row.get("output_path", "")
             size_text = row.get("original_size", "")
             candidate = source
-            if row.get("status") == "ok" and candidate_text:
+            if row.get("status") in {"ok", TRANSCODED_REPORT_STATUS} and candidate_text:
                 candidate = Path(candidate_text).expanduser().resolve()
                 size_text = row.get("trimmed_size", "")
             try:
@@ -489,6 +527,53 @@ def completed_sources_from_report(
             except OSError:
                 continue
     return completed
+
+
+def transcode_state_from_report(path: Path) -> tuple[set[Path], set[Path]]:
+    if not path.exists() or path.stat().st_size == 0:
+        return set(), set()
+    type_d_handled: set[Path] = set()
+    transcoded: set[Path] = set()
+    with path.open("r", encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream, delimiter="\t")
+        if tuple(reader.fieldnames or ()) != REPORT_COLUMNS:
+            raise RuntimeError(f"report has an incompatible TSV header: {path}")
+        for row in reader:
+            source_text = row.get("source_path", "")
+            status = row.get("status", "")
+            if not source_text:
+                continue
+            source = Path(source_text).expanduser().resolve()
+            if status in COMPLETED_REPORT_STATUSES:
+                size_field = (
+                    "trimmed_size"
+                    if status in {"ok", TRANSCODED_REPORT_STATUS}
+                    else "original_size"
+                )
+                try:
+                    expected_size = int(row.get(size_field, ""))
+                    if (
+                        source.is_file()
+                        and not source.is_symlink()
+                        and source.stat().st_size == expected_size
+                    ):
+                        type_d_handled.add(source)
+                except (OSError, TypeError, ValueError):
+                    pass
+            if status != TRANSCODED_REPORT_STATUS:
+                continue
+            output_text = row.get("output_path", "")
+            size_text = row.get("trimmed_size", "")
+            if not output_text:
+                continue
+            try:
+                expected_size = int(size_text)
+                output = Path(output_text).expanduser().resolve()
+                if output.is_file() and output.stat().st_size == expected_size:
+                    transcoded.add(source)
+            except (OSError, TypeError, ValueError):
+                continue
+    return type_d_handled, transcoded
 
 
 def report_values(
@@ -536,14 +621,14 @@ def reserve_processing_file(path: Path) -> None:
         pass
 
 
-def check_available_space(source: Path, source_size: int) -> tuple[int, int]:
-    free = shutil.disk_usage(source.parent).free
+def check_available_space(directory: Path, source_size: int) -> tuple[int, int]:
+    free = shutil.disk_usage(directory).free
     required = source_size * 2
     if free < required:
         raise RuntimeError(
             "insufficient free space: "
             f"{free} bytes available, {required} bytes required "
-            f"(2 x source size) on {source.parent}"
+            f"(2 x source size) on {directory}"
         )
     return free, required
 
@@ -557,7 +642,13 @@ def validate_with_tsduck(path: Path, tsanalyze: str) -> list[str]:
 
     command = [tsanalyze, "--deterministic", "--no-pager", "--service-list", str(path)]
     print(f"  validate: {command_text(command)}")
-    result = subprocess.run(command, capture_output=True, text=True, errors="replace")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(
@@ -573,6 +664,87 @@ def validate_with_tsduck(path: Path, tsanalyze: str) -> list[str]:
             + (f":\n{detail}" if detail else "")
         )
     return service_ids
+
+
+def probe_programs(
+    path: Path, ffprobe: str
+) -> tuple[dict[int, tuple[tuple[object, ...], ...]], float | None]:
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-show_programs",
+        "-show_format",
+        "-of",
+        "json",
+        str(path),
+    ]
+    print(f"  probe:    {command_text(command)}")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"ffprobe failed with exit code {result.returncode}"
+            + (f":\n{detail}" if detail else "")
+        )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"ffprobe returned invalid JSON: {error}") from error
+
+    programs: dict[int, tuple[tuple[object, ...], ...]] = {}
+    for program in document.get("programs", []):
+        if not isinstance(program, dict):
+            continue
+        try:
+            program_id = int(program["program_id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        streams: list[tuple[object, ...]] = []
+        for stream in program.get("streams", []):
+            if not isinstance(stream, dict):
+                continue
+            codec_type = str(stream.get("codec_type", ""))
+            stream_id = str(stream.get("id", stream.get("index", "")))
+            signature: tuple[object, ...] = (stream_id, codec_type)
+            if codec_type != "video":
+                signature += (str(stream.get("codec_name", "")),)
+            streams.append(signature)
+        programs[program_id] = tuple(sorted(streams, key=repr))
+    if not programs:
+        raise RuntimeError("ffprobe found no programs")
+
+    duration: float | None = None
+    try:
+        duration = float(document.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        pass
+    return programs, duration
+
+
+def compare_programs(source: Path, output: Path, ffprobe: str) -> None:
+    source_programs, source_duration = probe_programs(source, ffprobe)
+    output_programs, output_duration = probe_programs(output, ffprobe)
+    if source_programs != output_programs:
+        raise RuntimeError(
+            "program or non-video stream layout changed after processing: "
+            f"source={source_programs!r} output={output_programs!r}"
+        )
+    if source_duration is None or output_duration is None:
+        return
+    tolerance = max(5.0, source_duration * 0.01)
+    if abs(source_duration - output_duration) > tolerance:
+        raise RuntimeError(
+            "duration changed after processing: "
+            f"source={source_duration:.3f}s output={output_duration:.3f}s "
+            f"tolerance={tolerance:.3f}s"
+        )
 
 
 def install_trimmed_file(
@@ -605,11 +777,40 @@ def install_trimmed_file(
     return source
 
 
+def path_exists(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
+def install_external_file(source: Path, processing: Path, output: Path) -> Path:
+    if path_exists(output):
+        raise FileExistsError(f"output already exists: {output}")
+
+    os.replace(processing, output)
+    temporary_link = source.with_name(f".{source.name}.tsreplace-link-{os.getpid()}")
+    try:
+        if path_exists(temporary_link):
+            raise FileExistsError(f"temporary symlink already exists: {temporary_link}")
+        os.symlink(output, temporary_link)
+        os.replace(temporary_link, source)
+    except BaseException:
+        temporary_link.unlink(missing_ok=True)
+        if source.is_file() and not source.is_symlink():
+            output.unlink(missing_ok=True)
+        raise
+    return output
+
+
 def trim_one(
     source: Path,
+    source_root: Path,
     tsreplace: str,
     tsanalyze: str,
+    ffprobe: str | None,
     processing_suffix: str,
+    output_directory: Path | None,
+    encoder_command: list[str] | None,
+    encoder_display_command: list[str] | None,
+    smart_remove_typed: bool,
     backup_suffix: str | None,
     no_replace: bool,
     protected_keywords: list[str],
@@ -618,27 +819,40 @@ def trim_one(
     dry_run: bool,
     remove_failed_processing: bool,
 ) -> TrimResult | str | None:
-    processing = source.with_name(source.name + processing_suffix)
-    output = source.with_name(f"{source.stem}-trimed{source.suffix}") if no_replace else source
+    if output_directory is None:
+        processing = source.with_name(source.name + processing_suffix)
+        output = (
+            source.with_name(f"{source.stem}-trimed{source.suffix}")
+            if no_replace
+            else source
+        )
+    else:
+        output = output_directory / source.relative_to(source_root)
+        processing = output.with_name(output.name + processing_suffix)
     command = [
         tsreplace,
         "-i",
         str(source),
         "-o",
         str(processing),
-        "--smart-remove-typed",
     ]
+    if smart_remove_typed:
+        command.append("--smart-remove-typed")
+    display_command = command.copy()
+    if encoder_command is not None:
+        command.extend(("-e", *encoder_command))
+        display_command.extend(("-e", *(encoder_display_command or encoder_command)))
 
     print(f"\n[{source}]")
     if program_info.name:
         print(f"  program:  {program_info.start} {program_info.name}")
-    print(f"  trim:     {command_text(command)}")
+    print(f"  trim:     {command_text(display_command)}")
     print(f"  temporary:{processing}")
-    if no_replace:
+    if no_replace or output_directory is not None:
         print(f"  output:   {output}")
-    if no_replace and output.exists():
-        raise FileExistsError(f"trimmed output already exists: {output}")
-    if processing.exists():
+    if (no_replace or output_directory is not None) and path_exists(output):
+        raise FileExistsError(f"output already exists: {output}")
+    if path_exists(processing):
         raise FileExistsError(
             f"processing file already exists: {processing}; inspect or remove it first"
         )
@@ -656,17 +870,24 @@ def trim_one(
         if protected_keyword is not None:
             print(f"  skipped:  protected program title keyword {protected_keyword!r}")
             return protected_keyword
-    free, required = check_available_space(source, before.size)
-    print(f"  free space: {free} bytes (required: {required} bytes)")
     if dry_run:
         return None
+    processing.parent.mkdir(parents=True, exist_ok=True)
+    free, required = check_available_space(processing.parent, before.size)
+    print(f"  free space: {free} bytes (required: {required} bytes)")
+    if encoder_command is not None:
+        validate_with_tsduck(source, tsanalyze)
     reserve_processing_file(processing)
     try:
-        result = subprocess.run(command)
+        result = subprocess.run(command, check=False)
         if result.returncode != 0:
             raise RuntimeError(f"tsreplace failed with exit code {result.returncode}")
 
         services = validate_with_tsduck(processing, tsanalyze)
+        if encoder_command is not None:
+            if ffprobe is None:
+                raise RuntimeError("ffprobe is required for transcoding")
+            compare_programs(source, processing, ffprobe)
         if SourceState.read(source) != before:
             raise RuntimeError("source changed while trimming; it may still be recording")
 
@@ -690,9 +911,12 @@ def trim_one(
             )
 
         shutil.copystat(source, processing, follow_symlinks=False)
-        output = install_trimmed_file(source, processing, backup_suffix, no_replace)
+        if output_directory is None:
+            output = install_trimmed_file(source, processing, backup_suffix, no_replace)
+        else:
+            output = install_external_file(source, processing, output)
         print(
-            f"  {'created' if no_replace else 'replaced'}: {output} "
+            f"  {'created and linked' if output_directory is not None else ('created' if no_replace else 'replaced')}: {output} "
             f"({before.size} -> {trimmed_size} bytes, "
             f"saved {saved} bytes, {percent:.2f}%)"
         )
@@ -723,13 +947,31 @@ def main() -> int:
         raise ValueError("--processing-suffix must not be empty")
     if args.backup_suffix == "":
         raise ValueError("--backup-suffix must not be empty")
+    if args.output_directory is not None and args.no_replace:
+        raise ValueError("--output-directory and --no-replace cannot be used together")
+    if args.output_directory is not None and args.backup_suffix is not None:
+        raise ValueError("--output-directory and --backup-suffix cannot be used together")
     if args.no_replace and args.backup_suffix is not None:
         raise ValueError("--no-replace and --backup-suffix cannot be used together")
     if args.no_report and args.report is not None:
         raise ValueError("--report and --no-report cannot be used together")
     if not math.isfinite(args.minimum_savings_mib) or args.minimum_savings_mib < 0:
         raise ValueError("--minimum-savings-mib must be a finite non-negative number")
+    if bool(args.hiraku_address) != bool(args.hiraku_secret):
+        raise ValueError("--hiraku-address and --hiraku-secret must be used together")
+    if args.hiraku_address and not args.hiraku_pipe:
+        raise ValueError("--hiraku-pipe must not be empty")
     minimum_savings_bytes = int(args.minimum_savings_mib * 1024 * 1024)
+
+    output_directory = (
+        args.output_directory.expanduser().resolve()
+        if args.output_directory is not None
+        else None
+    )
+    if output_directory is not None and (
+        output_directory == directory or directory in output_directory.parents
+    ):
+        raise ValueError("--output-directory must be outside the input directory")
 
     report_path: Path | None = None
     if not args.no_report:
@@ -744,25 +986,33 @@ def main() -> int:
     if not args.no_protect_keywords:
         protected_keywords[:0] = DEFAULT_PROTECTED_KEYWORDS
     all_sources = find_files(directory, extensions, args.recursive)
-    completed_sources = (
-        completed_sources_from_report(
+    transcode_enabled = bool(args.hiraku_address)
+    type_d_handled_sources: set[Path] = set()
+    if report_path is None:
+        completed_sources: set[Path] = set()
+    elif transcode_enabled:
+        type_d_handled_sources, completed_sources = transcode_state_from_report(
+            report_path
+        )
+    else:
+        completed_sources = completed_sources_from_report(
             report_path,
             protected_keywords,
             minimum_savings_bytes,
             not args.no_skip_channels,
         )
-        if report_path is not None
-        else set()
-    )
     sources = [source for source in all_sources if source not in completed_sources]
     print(f"directory: {directory}")
     print(f"files:     {len(all_sources)}")
     print(f"reported:  {len(all_sources) - len(sources)} already completed")
     print(f"pending:   {len(sources)}")
-    print(
-        f"minimum savings: {minimum_savings_bytes} bytes "
-        f"({args.minimum_savings_mib:g} MiB)"
-    )
+    if transcode_enabled:
+        print(f"reported Type-D decisions: {len(type_d_handled_sources)}")
+    else:
+        print(
+            f"minimum savings: {minimum_savings_bytes} bytes "
+            f"({args.minimum_savings_mib:g} MiB)"
+        )
     if report_path is not None:
         print(f"report:    {report_path}{' (not written by dry-run)' if args.dry_run else ''}")
     if not sources:
@@ -772,14 +1022,28 @@ def main() -> int:
         tsreplace = args.tsreplace
         tsanalyze = args.tsanalyze
         tstables = args.tstables
+        ffprobe = args.ffprobe if transcode_enabled else None
+        hiraku = args.hiraku
     else:
         tsreplace = resolve_executable(args.tsreplace, "tsreplace")
         tsanalyze = resolve_executable(args.tsanalyze, "tsanalyze")
         tstables = resolve_executable(args.tstables, "tstables")
+        ffprobe = (
+            resolve_executable(args.ffprobe, "ffprobe")
+            if transcode_enabled
+            else None
+        )
+        hiraku = (
+            resolve_executable(args.hiraku, "hiraku")
+            if args.hiraku_address
+            else args.hiraku
+        )
         tsanalyze_version = check_tsanalyze(tsanalyze)
         print(f"tsreplace: {tsreplace}")
         print(f"tsanalyze: {tsanalyze} ({tsanalyze_version})")
         print(f"tstables:  {tstables}")
+        if ffprobe is not None:
+            print(f"ffprobe:   {ffprobe}")
         if protected_keywords:
             print(f"protected titles: {', '.join(protected_keywords)}")
         if not args.no_skip_channels:
@@ -790,6 +1054,24 @@ def main() -> int:
             print(f"skipped channels: {', '.join(skipped_channel_names)}")
         if report_path is not None:
             initialize_report(report_path)
+
+    encoder_command = None
+    encoder_display_command = None
+    if args.hiraku_address:
+        encoder_command = [
+            hiraku,
+            "pipe",
+            args.hiraku_address,
+            args.hiraku_secret,
+            args.hiraku_pipe,
+        ]
+        encoder_display_command = [
+            hiraku,
+            "pipe",
+            args.hiraku_address,
+            "<redacted>",
+            args.hiraku_pipe,
+        ]
 
     succeeded: list[TrimResult] = []
     skipped_protected = 0
@@ -818,7 +1100,16 @@ def main() -> int:
                 if args.dry_run or args.no_skip_channels
                 else skipped_channel_reason(program_info)
             )
-            if channel_reason is not None:
+            protected_keyword = next(
+                (
+                    keyword
+                    for keyword in protected_keywords
+                    if program_info.name
+                    and keyword.casefold() in program_info.name.casefold()
+                ),
+                None,
+            )
+            if channel_reason is not None and not transcode_enabled:
                 skipped_channel += 1
                 print(f"\n[{source}]")
                 if program_info.name:
@@ -847,28 +1138,63 @@ def main() -> int:
                         ),
                     )
                 continue
+            smart_remove_typed = True
+            transcode_notes: list[str] = []
+            if transcode_enabled:
+                if source.resolve() in type_d_handled_sources:
+                    smart_remove_typed = False
+                    transcode_notes.append("Type-D already handled according to TSV")
+                if channel_reason is not None:
+                    smart_remove_typed = False
+                    transcode_notes.append(channel_reason)
+                if protected_keyword is not None:
+                    smart_remove_typed = False
+                    transcode_notes.append(
+                        f"protected program title keyword: {protected_keyword}"
+                    )
+                if transcode_notes:
+                    print(f"\n[{source}]")
+                    print(f"  transcode only: {'; '.join(transcode_notes)}")
             result = trim_one(
                 source=source,
+                source_root=directory,
                 tsreplace=tsreplace,
                 tsanalyze=tsanalyze,
+                ffprobe=ffprobe,
                 processing_suffix=args.processing_suffix,
+                output_directory=output_directory,
+                encoder_command=encoder_command,
+                encoder_display_command=encoder_display_command,
+                smart_remove_typed=smart_remove_typed,
                 backup_suffix=args.backup_suffix,
                 no_replace=args.no_replace,
-                protected_keywords=protected_keywords,
+                protected_keywords=([] if transcode_enabled else protected_keywords),
                 program_info=program_info,
-                minimum_savings_bytes=minimum_savings_bytes,
+                minimum_savings_bytes=(0 if transcode_enabled else minimum_savings_bytes),
                 dry_run=args.dry_run,
                 remove_failed_processing=args.remove_failed_processing,
             )
             if isinstance(result, TrimResult):
-                status = "ok" if result.published else "skipped_small_savings"
+                status = (
+                    TRANSCODED_REPORT_STATUS
+                    if transcode_enabled and result.published
+                    else ("ok" if result.published else "skipped_small_savings")
+                )
                 if result.published:
                     succeeded.append(result)
                 else:
                     skipped_small += 1
                 if report_path is not None:
                     finished = datetime.now(JST)
-                    message = metadata_message
+                    message_parts = [part for part in [metadata_message] if part]
+                    if transcode_enabled:
+                        message_parts.append(
+                            "remote transcode with Type-D trim"
+                            if smart_remove_typed
+                            else "remote transcode without Type-D trim"
+                        )
+                        message_parts.extend(transcode_notes)
+                    message = "; ".join(message_parts)
                     if not result.published:
                         small_message = (
                             f"candidate savings below {minimum_savings_bytes} bytes; "
