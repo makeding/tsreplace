@@ -101,6 +101,42 @@ class TrimDirectoryTest(unittest.TestCase):
             self.assertIn("-e hiraku pipe", command_line)
             self.assertNotIn("--smart-remove-typed", command_line)
 
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        str(SCRIPT),
+                        str(root),
+                        "--report",
+                        str(report),
+                        "--output-directory",
+                        str(root.parent / f"{root.name}-archive"),
+                        "--hiraku-address",
+                        "192.168.6.230:40773",
+                        "--hiraku-secret",
+                        "secret",
+                    ],
+                ),
+                mock.patch.object(
+                    trim_directory,
+                    "resolve_executable",
+                    side_effect=lambda value, _label: value,
+                ),
+                mock.patch.object(
+                    trim_directory,
+                    "check_tsanalyze",
+                    return_value="TSDuck test",
+                ),
+                mock.patch.object(trim_directory, "extract_program_info") as extract,
+                mock.patch.object(trim_directory, "trim_one", return_value=None) as trim,
+                redirect_stdout(io.StringIO()),
+            ):
+                self.assertEqual(trim_directory.main(), 0)
+
+            extract.assert_not_called()
+            self.assertFalse(trim.call_args.kwargs["smart_remove_typed"])
+
     def test_transcode_without_smart_trim_uses_hiraku_and_links_output(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

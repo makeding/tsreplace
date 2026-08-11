@@ -306,8 +306,9 @@ ffprobeでprogram ID、映像以外のstream構成、再生時間を比較した
 remote transcode時は既存TSVを先に読みます。従来の`ok`、保護タイトル、内蔵
 チャンネルskip、削減量不足の記録が現在の元ファイルと一致する場合、Type-Dは
 処理済みまたは処理不要とみなし、`--smart-remove-typed`を再指定しません。ただし
-ファイル自体のtranscodeはskipしません。TSVに判断記録がないファイルだけ、remote
-transcodeとsmart Type-D trimを同時に実行します。remote transcode完了行は
+ファイル自体のtranscodeはskipしません。処理済みと確認できたファイルではEIT取得、
+保護タイトル、チャンネルskip判定も省略します。TSVに判断記録がないファイルだけ、
+remote transcodeとsmart Type-D trimを同時に実行します。remote transcode完了行は
 `transcoded`として追記され、次回以降の完了判定に使われます。純粋なtrimとして
 実行する場合は、従来どおり保護タイトルと対象外チャンネルをファイル単位でskip
 します。

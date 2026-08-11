@@ -1082,13 +1082,20 @@ def main() -> int:
         process_started_at = datetime.now(JST)
         process_started = time.monotonic()
         original_size = source.stat().st_size
+        type_d_already_handled = (
+            transcode_enabled and source.resolve() in type_d_handled_sources
+        )
         program_info = ProgramInfo()
         metadata_message = ""
         try:
-            if not args.dry_run and (
-                report_path is not None
-                or protected_keywords
-                or not args.no_skip_channels
+            if (
+                not args.dry_run
+                and not type_d_already_handled
+                and (
+                    report_path is not None
+                    or protected_keywords
+                    or not args.no_skip_channels
+                )
             ):
                 try:
                     program_info = extract_program_info(source, tstables)
@@ -1097,14 +1104,15 @@ def main() -> int:
                     print(f"\n[{source}]\n  warning:  {metadata_message}")
             channel_reason = (
                 None
-                if args.dry_run or args.no_skip_channels
+                if args.dry_run or args.no_skip_channels or type_d_already_handled
                 else skipped_channel_reason(program_info)
             )
             protected_keyword = next(
                 (
                     keyword
                     for keyword in protected_keywords
-                    if program_info.name
+                    if not type_d_already_handled
+                    and program_info.name
                     and keyword.casefold() in program_info.name.casefold()
                 ),
                 None,
@@ -1138,11 +1146,10 @@ def main() -> int:
                         ),
                     )
                 continue
-            smart_remove_typed = True
+            smart_remove_typed = not type_d_already_handled
             transcode_notes: list[str] = []
             if transcode_enabled:
-                if source.resolve() in type_d_handled_sources:
-                    smart_remove_typed = False
+                if type_d_already_handled:
                     transcode_notes.append("Type-D already handled according to TSV")
                 if channel_reason is not None:
                     smart_remove_typed = False
