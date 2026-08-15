@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from ts_type_d import detect_sparse_smart_trim
+
 DEFAULT_EXTENSIONS = (".m2ts", ".ts")
 DEFAULT_PROTECTED_KEYWORDS = ("紅白歌合戦", "開票速報")
 DEFAULT_SKIPPED_NETWORKS = {
@@ -53,13 +55,18 @@ REPORT_COLUMNS = (
 )
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1F\x7F-\x9F]")
 TRANSCODED_REPORT_STATUS = "transcoded"
-COMPLETED_REPORT_STATUSES = {
+PUBLISHED_REPORT_STATUS = "published"
+OUTPUT_REPORT_STATUSES = {
     "ok",
+    TRANSCODED_REPORT_STATUS,
+    PUBLISHED_REPORT_STATUS,
+}
+COMPLETED_REPORT_STATUSES = {
+    *OUTPUT_REPORT_STATUSES,
     "skipped_protected",
     "skipped_channel",
     "skipped_small_savings",
     "unchanged",
-    TRANSCODED_REPORT_STATUS,
 }
 
 
@@ -95,6 +102,18 @@ class ProgramInfo:
     service_id: str = ""
     event_id: str = ""
     original_network_id: int | None = None
+
+
+@dataclass(frozen=True)
+class SourceMediaInfo:
+    video_codecs: tuple[str, ...]
+    duration: float | None
+
+    @property
+    def is_hevc(self) -> bool:
+        return bool(self.video_codecs) and all(
+            codec == "hevc" for codec in self.video_codecs
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -133,7 +152,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--ffprobe",
         default="ffprobe",
-        help="ffprobe executable used for source/output comparison",
+        help="ffprobe executable used for codec, duration, and output validation",
     )
     parser.add_argument(
         "--protect-keyword",
@@ -216,7 +235,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="list files and commands without changing anything",
+        help=(
+            "list files and commands without changing anything; remote mode still "
+            "runs read-only codec and Type-D probes"
+        ),
     )
     parser.add_argument(
         "--report",
@@ -514,7 +536,7 @@ def completed_sources_from_report(
             candidate_text = row.get("output_path", "")
             size_text = row.get("original_size", "")
             candidate = source
-            if row.get("status") in {"ok", TRANSCODED_REPORT_STATUS} and candidate_text:
+            if row.get("status") in OUTPUT_REPORT_STATUSES and candidate_text:
                 candidate = Path(candidate_text).expanduser().resolve()
                 size_text = row.get("trimmed_size", "")
             try:
@@ -547,7 +569,7 @@ def transcode_state_from_report(path: Path) -> tuple[set[Path], set[Path]]:
             if status in COMPLETED_REPORT_STATUSES:
                 size_field = (
                     "trimmed_size"
-                    if status in {"ok", TRANSCODED_REPORT_STATUS}
+                    if status in OUTPUT_REPORT_STATUSES
                     else "original_size"
                 )
                 try:
@@ -560,7 +582,7 @@ def transcode_state_from_report(path: Path) -> tuple[set[Path], set[Path]]:
                         type_d_handled.add(source)
                 except (OSError, TypeError, ValueError):
                     pass
-            if status != TRANSCODED_REPORT_STATUS:
+            if status not in {TRANSCODED_REPORT_STATUS, PUBLISHED_REPORT_STATUS}:
                 continue
             output_text = row.get("output_path", "")
             size_text = row.get("trimmed_size", "")
@@ -722,10 +744,59 @@ def probe_programs(
 
     duration: float | None = None
     try:
-        duration = float(document.get("format", {}).get("duration"))
+        parsed_duration = float(document.get("format", {}).get("duration"))
+        if math.isfinite(parsed_duration) and parsed_duration > 0:
+            duration = parsed_duration
     except (TypeError, ValueError):
         pass
     return programs, duration
+
+
+def probe_source_media(path: Path, ffprobe: str) -> SourceMediaInfo:
+    command = [
+        ffprobe,
+        "-v",
+        "error",
+        "-select_streams",
+        "v",
+        "-show_entries",
+        "stream=codec_name:format=duration",
+        "-show_format",
+        "-of",
+        "json",
+        str(path),
+    ]
+    print(f"  probe:    {command_text(command)}")
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        errors="replace",
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(
+            f"ffprobe failed with exit code {result.returncode}"
+            + (f":\n{detail}" if detail else "")
+        )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"ffprobe returned invalid JSON: {error}") from error
+    codecs = tuple(
+        str(stream.get("codec_name", "")).casefold()
+        for stream in document.get("streams", [])
+        if isinstance(stream, dict)
+    )
+    duration: float | None = None
+    try:
+        parsed_duration = float(document.get("format", {}).get("duration"))
+        if math.isfinite(parsed_duration) and parsed_duration > 0:
+            duration = parsed_duration
+    except (TypeError, ValueError):
+        pass
+    return SourceMediaInfo(codecs, duration)
 
 
 def compare_programs(source: Path, output: Path, ffprobe: str) -> None:
@@ -811,6 +882,8 @@ def trim_one(
     encoder_command: list[str] | None,
     encoder_display_command: list[str] | None,
     smart_remove_typed: bool,
+    smart_remove_typed_duration: float | None,
+    copy_source: bool,
     backup_suffix: str | None,
     no_replace: bool,
     protected_keywords: list[str],
@@ -819,6 +892,8 @@ def trim_one(
     dry_run: bool,
     remove_failed_processing: bool,
 ) -> TrimResult | str | None:
+    if copy_source and (encoder_command is not None or smart_remove_typed):
+        raise ValueError("copy_source cannot be combined with trim or transcode")
     if output_directory is None:
         processing = source.with_name(source.name + processing_suffix)
         output = (
@@ -829,24 +904,38 @@ def trim_one(
     else:
         output = output_directory / source.relative_to(source_root)
         processing = output.with_name(output.name + processing_suffix)
-    command = [
-        tsreplace,
-        "-i",
-        str(source),
-        "-o",
-        str(processing),
-    ]
-    if smart_remove_typed:
-        command.append("--smart-remove-typed")
-    display_command = command.copy()
-    if encoder_command is not None:
-        command.extend(("-e", *encoder_command))
-        display_command.extend(("-e", *(encoder_display_command or encoder_command)))
+    command: list[str] | None = None
+    display_command: list[str] | None = None
+    if not copy_source:
+        command = [
+            tsreplace,
+            "-i",
+            str(source),
+            "-o",
+            str(processing),
+        ]
+        if smart_remove_typed:
+            command.append("--smart-remove-typed")
+            if smart_remove_typed_duration is not None:
+                command.extend(
+                    (
+                        "--smart-remove-typed-duration",
+                        f"{smart_remove_typed_duration:.6f}",
+                    )
+                )
+        display_command = command.copy()
+        if encoder_command is not None:
+            command.extend(("-e", *encoder_command))
+            display_command.extend(("-e", *(encoder_display_command or encoder_command)))
 
     print(f"\n[{source}]")
     if program_info.name:
         print(f"  program:  {program_info.start} {program_info.name}")
-    print(f"  trim:     {command_text(display_command)}")
+    if copy_source:
+        print("  publish:  input is already HEVC; copying without trim or transcode")
+    else:
+        assert display_command is not None
+        print(f"  trim:     {command_text(display_command)}")
     print(f"  temporary:{processing}")
     if no_replace or output_directory is not None:
         print(f"  output:   {output}")
@@ -879,9 +968,13 @@ def trim_one(
         validate_with_tsduck(source, tsanalyze)
     reserve_processing_file(processing)
     try:
-        result = subprocess.run(command, check=False)
-        if result.returncode != 0:
-            raise RuntimeError(f"tsreplace failed with exit code {result.returncode}")
+        if copy_source:
+            shutil.copyfile(source, processing)
+        else:
+            assert command is not None
+            result = subprocess.run(command, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"tsreplace failed with exit code {result.returncode}")
 
         services = validate_with_tsduck(processing, tsanalyze)
         if encoder_command is not None:
@@ -1082,12 +1175,26 @@ def main() -> int:
         process_started_at = datetime.now(JST)
         process_started = time.monotonic()
         original_size = source.stat().st_size
-        type_d_already_handled = (
-            transcode_enabled and source.resolve() in type_d_handled_sources
-        )
         program_info = ProgramInfo()
         metadata_message = ""
         try:
+            media_info = (
+                probe_source_media(source, ffprobe)
+                if transcode_enabled and ffprobe is not None
+                else None
+            )
+            input_is_hevc = media_info.is_hevc if media_info is not None else False
+            type_d_already_handled = (
+                transcode_enabled and source.resolve() in type_d_handled_sources
+            )
+            sparse_type_d_message = ""
+            if transcode_enabled and not type_d_already_handled:
+                sparse_detection = detect_sparse_smart_trim(
+                    source, media_info.duration if media_info is not None else None
+                )
+                sparse_type_d_message = sparse_detection.message
+                type_d_already_handled = sparse_detection.handled
+                print(f"  Type-D:  {sparse_detection.message}")
             if (
                 not args.dry_run
                 and not type_d_already_handled
@@ -1150,7 +1257,10 @@ def main() -> int:
             transcode_notes: list[str] = []
             if transcode_enabled:
                 if type_d_already_handled:
-                    transcode_notes.append("Type-D already handled according to TSV")
+                    transcode_notes.append(
+                        sparse_type_d_message
+                        or "Type-D already handled according to TSV"
+                    )
                 if channel_reason is not None:
                     smart_remove_typed = False
                     transcode_notes.append(channel_reason)
@@ -1159,9 +1269,18 @@ def main() -> int:
                     transcode_notes.append(
                         f"protected program title keyword: {protected_keyword}"
                     )
+                if input_is_hevc:
+                    transcode_notes.append(
+                        "input already HEVC; remote encoder bypassed"
+                    )
                 if transcode_notes:
                     print(f"\n[{source}]")
-                    print(f"  transcode only: {'; '.join(transcode_notes)}")
+                    print(f"  processing: {'; '.join(transcode_notes)}")
+            source_encoder_command = None if input_is_hevc else encoder_command
+            source_encoder_display_command = (
+                None if input_is_hevc else encoder_display_command
+            )
+            copy_source = input_is_hevc and not smart_remove_typed
             result = trim_one(
                 source=source,
                 source_root=directory,
@@ -1170,9 +1289,15 @@ def main() -> int:
                 ffprobe=ffprobe,
                 processing_suffix=args.processing_suffix,
                 output_directory=output_directory,
-                encoder_command=encoder_command,
-                encoder_display_command=encoder_display_command,
+                encoder_command=source_encoder_command,
+                encoder_display_command=source_encoder_display_command,
                 smart_remove_typed=smart_remove_typed,
+                smart_remove_typed_duration=(
+                    media_info.duration
+                    if smart_remove_typed and media_info is not None
+                    else None
+                ),
+                copy_source=copy_source,
                 backup_suffix=args.backup_suffix,
                 no_replace=args.no_replace,
                 protected_keywords=([] if transcode_enabled else protected_keywords),
@@ -1183,7 +1308,9 @@ def main() -> int:
             )
             if isinstance(result, TrimResult):
                 status = (
-                    TRANSCODED_REPORT_STATUS
+                    PUBLISHED_REPORT_STATUS
+                    if input_is_hevc and result.published
+                    else TRANSCODED_REPORT_STATUS
                     if transcode_enabled and result.published
                     else ("ok" if result.published else "skipped_small_savings")
                 )
@@ -1195,11 +1322,18 @@ def main() -> int:
                     finished = datetime.now(JST)
                     message_parts = [part for part in [metadata_message] if part]
                     if transcode_enabled:
-                        message_parts.append(
-                            "remote transcode with Type-D trim"
-                            if smart_remove_typed
-                            else "remote transcode without Type-D trim"
-                        )
+                        if input_is_hevc:
+                            message_parts.append(
+                                "existing HEVC published with Type-D trim"
+                                if smart_remove_typed
+                                else "existing HEVC published without Type-D trim"
+                            )
+                        else:
+                            message_parts.append(
+                                "remote transcode with Type-D trim"
+                                if smart_remove_typed
+                                else "remote transcode without Type-D trim"
+                            )
                         message_parts.extend(transcode_notes)
                     message = "; ".join(message_parts)
                     if not result.published:

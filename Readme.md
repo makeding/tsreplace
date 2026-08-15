@@ -271,6 +271,8 @@ timestampを保持できるコンテナ入りの映像を想定しており、ra
 残す場合は `--backup-suffix .original`、元ファイルを置き換えずに
 `<元ファイル名>-trimed.ts` または `.m2ts` として出力する場合は `--no-replace`、
 実行内容だけ確認する場合は `--dry-run` を指定します。
+remote modeの`--dry-run`はファイルを変更しませんが、実際の分岐を表示するため
+ffprobeとType-Dの読み取り専用サンプリングは実行します。
 
 候補ファイルの削減量が10 MiB未満の場合は候補を削除し、元ファイルを置き換えません。
 閾値は `--minimum-savings-mib` で変更でき、0を指定すると無効になります。
@@ -307,11 +309,22 @@ remote transcode時は既存TSVを先に読みます。従来の`ok`、保護タ
 チャンネルskip、削減量不足の記録が現在の元ファイルと一致する場合、Type-Dは
 処理済みまたは処理不要とみなし、`--smart-remove-typed`を再指定しません。ただし
 ファイル自体のtranscodeはskipしません。処理済みと確認できたファイルではEIT取得、
-保護タイトル、チャンネルskip判定も省略します。TSVに判断記録がないファイルだけ、
-remote transcodeとsmart Type-D trimを同時に実行します。remote transcode完了行は
-`transcoded`として追記され、次回以降の完了判定に使われます。純粋なtrimとして
-実行する場合は、従来どおり保護タイトルと対象外チャンネルをファイル単位でskip
-します。
+保護タイトル、チャンネルskip判定も省略します。
+
+TSVに判断記録がない場合は、PMTからType-D PIDを取得し、常時保持されるエントリ
+コンポーネントを除外します。PCRと先頭映像・音声PTSから疎な時間indexを作り、全体を
+走査せずに一部区間をサンプリングします。20分以上の入力で、
+先頭および末尾または14.5分周期の保持区間にType-Dがあり、10分ごとに抽出した
+中間区間のすべてにType-Dがない場合は、smart trim済みとみなします。判定条件を
+満たさない場合は未処理として通常どおりtrimします。新しくsmart trimする場合は
+ffprobeで得た入力時間も渡すため、末尾1分間を保持します。
+
+入力の全映像streamがすでにHEVCの場合はHiraku encoderへ送りません。Type-Dが
+未処理ならローカルのsmart trimだけを実行し、処理済みなら内容をそのまま出力先へ
+publishして元ファイルをsymlinkに置き換えます。remote encode完了行は`transcoded`、
+既存HEVCのpublish完了行は`published`としてTSVへ追記し、どちらも次回以降の
+完了判定に使います。純粋なtrimとして実行する場合は、従来どおり保護タイトルと
+対象外チャンネルをファイル単位でskipします。
 
 ### --log &lt;string&gt;
 ログを指定のファイルに出力します。
