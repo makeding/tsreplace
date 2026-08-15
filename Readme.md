@@ -292,10 +292,10 @@ Hirakuのremote pipeを使って映像をFFmpegで転送・圧縮し、別のス
 保存する場合は、`--hiraku-address`、`--hiraku-secret`、`--output-directory`を
 指定します。`--hiraku-pipe`のデフォルトは`FFMPEG-X265`です。出力先では入力
 ディレクトリからの相対パスを維持し、`<ファイル名>.processing`へ書き込みます。
-元TSと処理後TSをTSDuckで走査し、188バイト境界とservice情報を確認します。さらに
-ffprobeでprogram ID、映像以外のstream構成、再生時間を比較した後、最終ファイル名へ
-変更し、元ファイルを同名の絶対symlinkへ原子的に置き換えます。処理・検証に失敗した
-場合は元ファイルを変更しません。
+元TSのTSDuck走査はremote transcodeと並行して実行します。処理後TSのTSDuck走査と
+ffprobeによるprogram ID、映像以外のstream構成、再生時間の比較も並行して実行し、
+両方が成功した場合だけ最終ファイル名へ変更して、元ファイルを同名の絶対symlinkへ
+原子的に置き換えます。処理・検証に失敗した場合は元ファイルを変更しません。
 
 ```
 ./scripts/trim_directory.py /mnt/recordings --recursive \
@@ -305,11 +305,12 @@ ffprobeでprogram ID、映像以外のstream構成、再生時間を比較した
   --hiraku-pipe FFMPEG-X265
 ```
 
-remote transcode時は既存TSVを先に読みます。従来の`ok`、保護タイトル、内蔵
-チャンネルskip、削減量不足の記録が現在の元ファイルと一致する場合、Type-Dは
-処理済みまたは処理不要とみなし、`--smart-remove-typed`を再指定しません。ただし
-ファイル自体のtranscodeはskipしません。処理済みと確認できたファイルではEIT取得、
-保護タイトル、チャンネルskip判定も省略します。
+remote transcode時は既存TSVを先に読みます。`ok`、`transcoded_trimmed`、
+`published_trimmed`の記録が現在のファイルサイズと一致する場合だけType-Dを
+処理済みとみなし、`--smart-remove-typed`を再指定しません。保護タイトル、内蔵
+チャンネルskip、削減量不足、trimなしの`transcoded`/`published`はtrim済みの証明
+として使いません。Type-D処理済みと確認できたファイルではEIT取得、保護タイトル、
+チャンネルskip判定も省略します。
 
 TSVに判断記録がない場合は、PMTからType-D PIDを取得し、常時保持されるエントリ
 コンポーネントを除外します。PCRと先頭映像・音声PTSから疎な時間indexを作り、全体を
@@ -321,10 +322,10 @@ ffprobeで得た入力時間も渡すため、末尾1分間を保持します。
 
 入力の全映像streamがすでにHEVCの場合はHiraku encoderへ送りません。Type-Dが
 未処理ならローカルのsmart trimだけを実行し、処理済みなら内容をそのまま出力先へ
-publishして元ファイルをsymlinkに置き換えます。remote encode完了行は`transcoded`、
-既存HEVCのpublish完了行は`published`としてTSVへ追記し、どちらも次回以降の
-完了判定に使います。純粋なtrimとして実行する場合は、従来どおり保護タイトルと
-対象外チャンネルをファイル単位でskipします。
+publishして元ファイルをsymlinkに置き換えます。Type-D trimを伴う完了行は
+`transcoded_trimmed`または`published_trimmed`、伴わない場合は`transcoded`または
+`published`としてTSVへ追記し、次回以降の完了判定に使います。純粋なtrimとして
+実行する場合は、従来どおり保護タイトルと対象外チャンネルをファイル単位でskipします。
 
 ### --log &lt;string&gt;
 ログを指定のファイルに出力します。

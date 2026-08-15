@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import csv
 import json
 import math
@@ -56,10 +57,25 @@ REPORT_COLUMNS = (
 CONTROL_CHARACTERS = re.compile(r"[\x00-\x1F\x7F-\x9F]")
 TRANSCODED_REPORT_STATUS = "transcoded"
 PUBLISHED_REPORT_STATUS = "published"
+TRANSCODED_TRIMMED_REPORT_STATUS = "transcoded_trimmed"
+PUBLISHED_TRIMMED_REPORT_STATUS = "published_trimmed"
 OUTPUT_REPORT_STATUSES = {
     "ok",
     TRANSCODED_REPORT_STATUS,
     PUBLISHED_REPORT_STATUS,
+    TRANSCODED_TRIMMED_REPORT_STATUS,
+    PUBLISHED_TRIMMED_REPORT_STATUS,
+}
+TYPE_D_TRIMMED_REPORT_STATUSES = {
+    "ok",
+    TRANSCODED_TRIMMED_REPORT_STATUS,
+    PUBLISHED_TRIMMED_REPORT_STATUS,
+}
+REMOTE_COMPLETED_REPORT_STATUSES = {
+    TRANSCODED_REPORT_STATUS,
+    PUBLISHED_REPORT_STATUS,
+    TRANSCODED_TRIMMED_REPORT_STATUS,
+    PUBLISHED_TRIMMED_REPORT_STATUS,
 }
 COMPLETED_REPORT_STATUSES = {
     *OUTPUT_REPORT_STATUSES,
@@ -566,7 +582,7 @@ def transcode_state_from_report(path: Path) -> tuple[set[Path], set[Path]]:
             if not source_text:
                 continue
             source = Path(source_text).expanduser().resolve()
-            if status in COMPLETED_REPORT_STATUSES:
+            if status in TYPE_D_TRIMMED_REPORT_STATUSES:
                 size_field = (
                     "trimmed_size"
                     if status in OUTPUT_REPORT_STATUSES
@@ -582,7 +598,7 @@ def transcode_state_from_report(path: Path) -> tuple[set[Path], set[Path]]:
                         type_d_handled.add(source)
                 except (OSError, TypeError, ValueError):
                     pass
-            if status not in {TRANSCODED_REPORT_STATUS, PUBLISHED_REPORT_STATUS}:
+            if status not in REMOTE_COMPLETED_REPORT_STATUSES:
                 continue
             output_text = row.get("output_path", "")
             size_text = row.get("trimmed_size", "")
@@ -947,6 +963,8 @@ def trim_one(
         )
 
     before = SourceState.read(source)
+    if encoder_command is not None and ffprobe is None:
+        raise RuntimeError("ffprobe is required for transcoding")
     if not dry_run and protected_keywords and program_info.name:
         protected_keyword = next(
             (
@@ -964,23 +982,60 @@ def trim_one(
     processing.parent.mkdir(parents=True, exist_ok=True)
     free, required = check_available_space(processing.parent, before.size)
     print(f"  free space: {free} bytes (required: {required} bytes)")
-    if encoder_command is not None:
-        validate_with_tsduck(source, tsanalyze)
     reserve_processing_file(processing)
     try:
-        if copy_source:
-            shutil.copyfile(source, processing)
-        else:
-            assert command is not None
-            result = subprocess.run(command, check=False)
-            if result.returncode != 0:
-                raise RuntimeError(f"tsreplace failed with exit code {result.returncode}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            source_validation = (
+                executor.submit(validate_with_tsduck, source, tsanalyze)
+                if encoder_command is not None
+                else None
+            )
+            if copy_source:
+                shutil.copyfile(source, processing)
+            else:
+                assert command is not None
+                result = subprocess.run(command, check=False)
+            source_validation_error: Exception | None = None
+            if source_validation is not None:
+                try:
+                    source_validation.result()
+                except Exception as error:
+                    source_validation_error = error
+            processing_error = (
+                RuntimeError(f"tsreplace failed with exit code {result.returncode}")
+                if not copy_source and result.returncode != 0
+                else None
+            )
+            if processing_error is not None or source_validation_error is not None:
+                failures: list[str] = []
+                if processing_error is not None:
+                    failures.append(f"processing: {processing_error}")
+                if source_validation_error is not None:
+                    failures.append(f"source validation: {source_validation_error}")
+                raise RuntimeError("; ".join(failures))
 
-        services = validate_with_tsduck(processing, tsanalyze)
-        if encoder_command is not None:
-            if ffprobe is None:
-                raise RuntimeError("ffprobe is required for transcoding")
-            compare_programs(source, processing, ffprobe)
+            output_validation = executor.submit(
+                validate_with_tsduck, processing, tsanalyze
+            )
+            program_comparison = (
+                executor.submit(compare_programs, source, processing, ffprobe)
+                if encoder_command is not None and ffprobe is not None
+                else None
+            )
+            validation_errors: list[str] = []
+            services: list[str] | None = None
+            try:
+                services = output_validation.result()
+            except Exception as error:
+                validation_errors.append(f"output validation: {error}")
+            if program_comparison is not None:
+                try:
+                    program_comparison.result()
+                except Exception as error:
+                    validation_errors.append(f"program comparison: {error}")
+            if validation_errors:
+                raise RuntimeError("; ".join(validation_errors))
+            assert services is not None
         if SourceState.read(source) != before:
             raise RuntimeError("source changed while trimming; it may still be recording")
 
@@ -1308,8 +1363,12 @@ def main() -> int:
             )
             if isinstance(result, TrimResult):
                 status = (
-                    PUBLISHED_REPORT_STATUS
+                    PUBLISHED_TRIMMED_REPORT_STATUS
+                    if input_is_hevc and smart_remove_typed and result.published
+                    else PUBLISHED_REPORT_STATUS
                     if input_is_hevc and result.published
+                    else TRANSCODED_TRIMMED_REPORT_STATUS
+                    if transcode_enabled and smart_remove_typed and result.published
                     else TRANSCODED_REPORT_STATUS
                     if transcode_enabled and result.published
                     else ("ok" if result.published else "skipped_small_savings")

@@ -5,6 +5,7 @@ import importlib.util
 import io
 import sys
 import tempfile
+import threading
 import types
 import unittest
 from contextlib import redirect_stdout
@@ -175,6 +176,37 @@ class TrimDirectoryTest(unittest.TestCase):
             extract.assert_not_called()
             self.assertFalse(trim.call_args.kwargs["smart_remove_typed"])
 
+    def test_skipped_report_does_not_claim_type_d_was_trimmed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "show.ts"
+            report = root / "report.tsv"
+            source.write_bytes(b"unchanged")
+            row = {column: "" for column in trim_directory.REPORT_COLUMNS}
+            row.update(
+                source_path=str(source),
+                status="skipped_channel",
+                original_size=str(source.stat().st_size),
+                trimmed_size=str(source.stat().st_size),
+                message="built-in channel skip: BS11",
+            )
+            with report.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=trim_directory.REPORT_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerow(row)
+
+            type_d_handled, completed = trim_directory.transcode_state_from_report(
+                report
+            )
+
+            self.assertEqual(type_d_handled, set())
+            self.assertEqual(completed, set())
+
     def test_published_report_marks_hevc_processing_complete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -207,6 +239,40 @@ class TrimDirectoryTest(unittest.TestCase):
             )
 
             self.assertEqual(type_d_handled, set())
+            self.assertEqual(completed, {source.resolve()})
+
+    def test_published_trimmed_report_proves_both_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "show.ts"
+            output = root / "archive" / "show.ts"
+            report = root / "report.tsv"
+            source.write_bytes(b"trimmed")
+            output.parent.mkdir()
+            output.write_bytes(b"trimmed")
+            row = {column: "" for column in trim_directory.REPORT_COLUMNS}
+            row.update(
+                source_path=str(source),
+                output_path=str(output),
+                status=trim_directory.PUBLISHED_TRIMMED_REPORT_STATUS,
+                original_size="100",
+                trimmed_size=str(output.stat().st_size),
+            )
+            with report.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(
+                    stream,
+                    fieldnames=trim_directory.REPORT_COLUMNS,
+                    delimiter="\t",
+                    lineterminator="\n",
+                )
+                writer.writeheader()
+                writer.writerow(row)
+
+            type_d_handled, completed = trim_directory.transcode_state_from_report(
+                report
+            )
+
+            self.assertEqual(type_d_handled, {source.resolve()})
             self.assertEqual(completed, {source.resolve()})
 
     def test_transcode_without_smart_trim_uses_hiraku_and_links_output(self) -> None:
@@ -289,6 +355,69 @@ class TrimDirectoryTest(unittest.TestCase):
             output = output_root / "series" / "show.ts"
             self.assertTrue(source.is_symlink())
             self.assertEqual(source.readlink(), output)
+
+    def test_source_validation_runs_while_transcoding(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source_root = root / "source"
+            output_root = root / "archive"
+            source = source_root / "show.ts"
+            source.parent.mkdir()
+            source.write_bytes(b"x" * 188)
+            source_validation_started = threading.Event()
+            transcode_started = threading.Event()
+
+            def validate(path: Path, _tsanalyze: str) -> list[str]:
+                if path == source:
+                    source_validation_started.set()
+                    self.assertTrue(transcode_started.wait(1))
+                return ["1"]
+
+            def run(command: list[str], **_kwargs: object) -> types.SimpleNamespace:
+                self.assertTrue(source_validation_started.wait(1))
+                transcode_started.set()
+                output = Path(command[command.index("-o") + 1])
+                output.write_bytes(source.read_bytes())
+                return types.SimpleNamespace(returncode=0)
+
+            with (
+                mock.patch.object(trim_directory.subprocess, "run", side_effect=run),
+                mock.patch.object(
+                    trim_directory, "validate_with_tsduck", side_effect=validate
+                ),
+                mock.patch.object(
+                    trim_directory,
+                    "check_available_space",
+                    return_value=(10_000, 376),
+                ),
+                mock.patch.object(trim_directory, "compare_programs"),
+            ):
+                result = trim_directory.trim_one(
+                    source=source,
+                    source_root=source_root,
+                    tsreplace="tsreplace",
+                    tsanalyze="tsanalyze",
+                    ffprobe="ffprobe",
+                    processing_suffix=".processing",
+                    output_directory=output_root,
+                    encoder_command=["hiraku", "pipe", "host", "secret", "PIPE"],
+                    encoder_display_command=[
+                        "hiraku", "pipe", "host", "<redacted>", "PIPE"
+                    ],
+                    smart_remove_typed=True,
+                    smart_remove_typed_duration=1800.0,
+                    copy_source=False,
+                    backup_suffix=None,
+                    no_replace=False,
+                    protected_keywords=[],
+                    program_info=trim_directory.ProgramInfo(),
+                    minimum_savings_bytes=0,
+                    dry_run=False,
+                    remove_failed_processing=False,
+                )
+
+            self.assertIsInstance(result, trim_directory.TrimResult)
+            self.assertTrue(source.is_symlink())
 
     def test_hevc_input_trims_type_d_without_hiraku(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
