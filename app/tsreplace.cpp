@@ -66,6 +66,21 @@ static int64_t diffTimestampTsAMinusB(int64_t a, int64_t b) {
     return diff;
 }
 
+// 90kHz の相対時刻を、符号付きの時:分:秒.msへ変換する。
+static tstring formatTimestampOffset(int64_t timestamp) {
+    constexpr int64_t TIMESTAMP_TIMEBASE = 90000;
+    const auto signedMillisec = timestamp / (TIMESTAMP_TIMEBASE / 1000);
+    const auto negative = signedMillisec < 0;
+    const auto millisec = negative ? -signedMillisec : signedMillisec;
+    const auto hours = millisec / (60 * 60 * 1000);
+    const auto minutes = (millisec / (60 * 1000)) % 60;
+    const auto seconds = (millisec / 1000) % 60;
+    const auto milliseconds = millisec % 1000;
+    return strsprintf(_T("%s%lld:%02lld:%02lld.%03lld"),
+        negative ? _T("-") : _T(""),
+        (long long)hours, (long long)minutes, (long long)seconds, (long long)milliseconds);
+}
+
 static_assert(TIMESTAMP_INVALID_VALUE == AV_NOPTS_VALUE);
 
 static const TCHAR *removeTypeDModeToStr(TSRRemoveTypeDMode mode) {
@@ -170,6 +185,7 @@ TSRReplaceParams::TSRReplaceParams() :
     replacefileformat(),
     output(),
     logfile(),
+    cutList(),
     startpoint(TSRReplaceStartPoint::KeyframPts),
     replaceDelay(0),
     endAtReplaceEOF(false),
@@ -178,6 +194,7 @@ TSRReplaceParams::TSRReplaceParams() :
     addHeaders(true),
     removeTypeDMode(TSRRemoveTypeDMode::Disabled),
     smartRemoveTypeDDuration(0),
+    removeTypeDExplicitlyDisabled(false),
     removeNonTargetService(true),
     selectService(0),
     copyFileTs(false) {
@@ -438,6 +455,8 @@ AVCodecID TSReplaceVideo::getVidCodecID() const {
 RGYTSStreamType TSReplaceVideo::getVideoStreamType() const {
     if (m_Demux.video.stream) {
         switch (m_Demux.video.stream->codecpar->codec_id) {
+        case AV_CODEC_ID_MPEG2VIDEO:
+            return RGYTSStreamType::H262_VIDEO;
         case AV_CODEC_ID_H264:
             return RGYTSStreamType::H264_VIDEO;
         case AV_CODEC_ID_HEVC:
@@ -991,8 +1010,15 @@ TSReplace::TSReplace() :
     m_tsPktSplitter(),
     m_fpTSIn(),
     m_fpTSOut(),
+    m_fpTSOutStdioBuf(),
     m_inputAbort(false),
     m_threadInputTS(),
+    m_threadOutputTS(),
+    m_queueOutput(),
+    m_bufferOutput(),
+    m_outputBlockSize(1 * 1024 * 1024),
+    m_outputIsPipe(false),
+    m_outputError(RGY_ERR_NONE),
     m_threadSendEncoder(),
     m_queueInputReplace(),
     m_queueInputEncoder(),
@@ -1002,13 +1028,11 @@ TSReplace::TSReplace() :
     m_vidPIDReplace(0x0100),
     m_pcrPIDReplace(0),
     m_vidDTSOutMax(TIMESTAMP_INVALID_VALUE),
-    m_vidPTS(TIMESTAMP_INVALID_VALUE),
-    m_vidDTS(TIMESTAMP_INVALID_VALUE),
+    m_vidDTSOut(TIMESTAMP_INVALID_VALUE),
     m_vidFirstFramePTS(TIMESTAMP_INVALID_VALUE),
-    m_vidFirstFrameDTS(TIMESTAMP_INVALID_VALUE),
     m_vidFirstKeyPTS(TIMESTAMP_INVALID_VALUE),
     m_startPoint(TSRReplaceStartPoint::KeyframPts),
-    m_vidFirstTimestamp(TIMESTAMP_INVALID_VALUE),
+    m_vidFirstTimestampOut(TIMESTAMP_INVALID_VALUE),
     m_vidFirstPacketPTS(TIMESTAMP_INVALID_VALUE),
     m_lastPat(),
     m_lastPmts(),
@@ -1031,6 +1055,9 @@ TSReplace::TSReplace() :
     m_removeNonTargetService(true),
     m_selectService(0),
     m_copyFileTs(false),
+    m_cut(),
+    m_ccRewriter(),
+    m_pidCutState(),
     m_parseNalH264(get_parse_nal_unit_h264_func()),
     m_parseNalHevc(get_parse_nal_unit_hevc_func()),
     m_encoder(),
@@ -1038,11 +1065,12 @@ TSReplace::TSReplace() :
     m_encThreadErr(),
     m_encQueueOut(),
     m_replaceDelay(0),
-    m_outputStartTimestamp(TIMESTAMP_INVALID_VALUE),
+    m_replaceFirstPTS(TIMESTAMP_INVALID_VALUE),
+    m_startTimestampSrc(TIMESTAMP_INVALID_VALUE),
     m_endAtReplaceEOF(false),
     m_eofCutDelayMs(100),
-    m_outputEndTimestamp(TIMESTAMP_INVALID_VALUE),
-    m_lastReplaceVidPTS(TIMESTAMP_INVALID_VALUE) {
+    m_endTimestampOut(TIMESTAMP_INVALID_VALUE),
+    m_lastReplaceVidPTSOut(TIMESTAMP_INVALID_VALUE) {
 
 }
 TSReplace::~TSReplace() {
@@ -1101,6 +1129,27 @@ RGY_ERR TSReplace::close() {
         AddMessage(RGY_LOG_DEBUG, _T("Close Encoder.\n"));
         m_encoder.reset();
     }
+
+    // 出力スレッドの終了処理: 残りのバッファをフラッシュしてEOFを通知し、書き込み完了を待ってからファイルを閉じる
+    if (m_threadOutputTS) {
+        AddMessage(RGY_LOG_DEBUG, _T("Flush output buffer.\n"));
+        if (auto err = flushOutputBuffer(); err != RGY_ERR_NONE && sts == RGY_ERR_NONE) {
+            sts = err;
+        }
+        if (m_queueOutput) {
+            m_queueOutput->setEOF();
+        }
+        AddMessage(RGY_LOG_DEBUG, _T("Finish thread to write output.\n"));
+        if (m_threadOutputTS->joinable()) {
+            m_threadOutputTS->join();
+        }
+        m_threadOutputTS.reset();
+        if (auto err = (RGY_ERR)m_outputError.load(); err != RGY_ERR_NONE && sts == RGY_ERR_NONE) {
+            sts = err;
+        }
+    }
+    m_queueOutput.reset();
+
     m_fpTSIn.reset();
     m_fpTSOut.reset();
     if (m_copyFileTs
@@ -1157,7 +1206,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_fileTS = prms.input;
     m_fileOut = prms.output;
     m_startPoint = prms.startpoint;
-    m_outputStartTimestamp = TIMESTAMP_INVALID_VALUE;
+    m_startTimestampSrc = TIMESTAMP_INVALID_VALUE;
     m_replaceDelay = prms.replaceDelay;
     m_addAud = prms.addAud;
     m_addHeaders = prms.addHeaders;
@@ -1167,11 +1216,47 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_removeNonTargetService = m_trimOnly ? false : prms.removeNonTargetService;
     m_copyFileTs = prms.copyFileTs;
 
+    m_replaceFirstPTS = TIMESTAMP_INVALID_VALUE;
+    if (!prms.cutList.empty()) {
+        if (const auto err = m_cut.load(prms.cutList); err != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("Failed to load cut list: %s\n"), m_cut.loadError().c_str());
+            return err;
+        }
+        m_ccRewriter.reset();
+        m_pidCutState.clear();
+        if (!m_removeNonTargetService) {
+            AddMessage(RGY_LOG_ERROR, _T("--preserve-other-services cannot be used with --cut-list.\n"));
+            return RGY_ERR_INVALID_PARAM;
+        }
+        if (prms.removeTypeDExplicitlyDisabled) {
+            AddMessage(RGY_LOG_WARN, _T("--cut-list always removes type-D packets (--no-remove-typed is ignored).\n"));
+        }
+        m_removeTypeDMode = TSRRemoveTypeDMode::All;
+        // 先頭トリム (cut -1 <pts>) は出力開始点と置換映像の原点を兼ねる。
+        // --replace-delay / --start-point による従来の推定は不要になるため、併用は認めない。
+        if (m_cut.headTrimPTS() != TIMESTAMP_INVALID_VALUE) {
+            if (m_replaceDelay != 0) {
+                AddMessage(RGY_LOG_ERROR, _T("--replace-delay cannot be used with the head trim (cut -1 <pts>) in the cut list.\n"));
+                return RGY_ERR_INVALID_PARAM;
+            }
+            m_replaceFirstPTS = m_cut.headTrimPTS();
+            // 先頭トリムが起点そのものを与えるので、--start-point による起点推定は使わない。
+            // (firstpacket の「PMT直後に起点確定」動作も無効化する)
+            m_startPoint = TSRReplaceStartPoint::FirstFrame;
+        }
+        // 末尾トリム (cut <pts> -1) は出力終了点を元TS上の絶対PTSで直接指定するので、
+        // 置換映像のEOFから終了点を推定する --end-at-replace-eof とは併用できない。
+        if (m_cut.tailTrimPTS() != TIMESTAMP_INVALID_VALUE && prms.endAtReplaceEOF) {
+            AddMessage(RGY_LOG_ERROR, _T("--end-at-replace-eof cannot be used with the tail trim (cut <pts> -1) in the cut list.\n"));
+            return RGY_ERR_INVALID_PARAM;
+        }
+    }
+
     // 置換映像EOF終了関連
     m_endAtReplaceEOF    = prms.endAtReplaceEOF;
     m_eofCutDelayMs      = prms.eofCutDelayMs;
-    m_outputEndTimestamp = TIMESTAMP_INVALID_VALUE;
-    m_lastReplaceVidPTS  = TIMESTAMP_INVALID_VALUE;
+    m_endTimestampOut      = TIMESTAMP_INVALID_VALUE;
+    m_lastReplaceVidPTSOut = TIMESTAMP_INVALID_VALUE;
 
     AddMessage(RGY_LOG_INFO, _T("Output  file: \"%s\".\n"), prms.output.c_str());
     AddMessage(RGY_LOG_INFO, _T("Input   file: \"%s\".\n"), prms.input.c_str());
@@ -1187,8 +1272,11 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
         }
         AddMessage(RGY_LOG_INFO, _T("Encoder Args:%s\n"), str.c_str());
     }
-    AddMessage(RGY_LOG_INFO, _T("Start point : %s.\n"), get_cx_desc(list_startpoint, (int)prms.startpoint));
+    AddMessage(RGY_LOG_INFO, _T("Start point : %s.\n"), get_cx_desc(list_startpoint, (int)m_startPoint));
     AddMessage(RGY_LOG_INFO, _T("Replace delay : %lld (90kHz ticks).\n"), (long long)m_replaceDelay);
+    if (m_replaceFirstPTS != TIMESTAMP_INVALID_VALUE) {
+        AddMessage(RGY_LOG_INFO, _T("Replace first PTS: %lld.\n"), (long long)m_replaceFirstPTS);
+    }
     AddMessage(RGY_LOG_INFO, _T("End at Replace EOF : %s (margin %d ms).\n"),
         m_endAtReplaceEOF ? _T("on") : _T("off"), m_eofCutDelayMs);
     AddMessage(RGY_LOG_INFO, _T("Add AUD     : %s.\n"), m_addAud ? _T("on") : _T("off"));
@@ -1239,6 +1327,12 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
         FILE *fptmp = nullptr;
         if (_tfopen_s(&fptmp, m_fileOut.c_str(), _T("wb")) == 0 && fptmp != nullptr) {
             m_fpTSOut = std::unique_ptr<FILE, fp_deleter>(fptmp, fp_deleter());
+            // ネットワークドライブ等でも大きな単位でまとめて書き込めるよう、stdioバッファを拡大する
+            m_fpTSOutStdioBuf.resize(m_outputBlockSize);
+            if (setvbuf(m_fpTSOut.get(), m_fpTSOutStdioBuf.data(), _IOFBF, m_fpTSOutStdioBuf.size()) != 0) {
+                AddMessage(RGY_LOG_WARN, _T("Failed to set output file buffer.\n"));
+                m_fpTSOutStdioBuf.clear();
+            }
         } else {
             AddMessage(RGY_LOG_ERROR, _T("Failed to open output file \"%s\".\n"), m_fileOut.c_str());
             return RGY_ERR_FILE_OPEN;
@@ -1246,6 +1340,9 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     } else {
         AddMessage(RGY_LOG_DEBUG, _T("Open output file stdout.\n"));
         m_fpTSOut = std::unique_ptr<FILE, fp_deleter>(stdout, fp_deleter());
+        // パイプ出力はスループットよりレイテンシを優先し、パケット単位で即時に書き込む
+        // (大きなstdioバッファは設定せず、既定のバッファリングのまま使用する)
+        m_outputIsPipe = true;
 #if defined(_WIN32) || defined(_WIN64)
         if (_setmode(_fileno(stdout), _O_BINARY) < 0) {
             AddMessage(RGY_LOG_ERROR, _T("failed to switch stdout to binary mode.\n"));
@@ -1261,6 +1358,9 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
 
     m_demuxer = std::make_unique<RGYTSDemuxer>();
     m_demuxer->init(log, m_selectService);
+    if (cutMode()) {
+        m_demuxer->setParsePESTimestampAllStreams(true);
+    }
 
     m_replaceFileFormat = prms.replacefileformat;
     if (m_trimOnly) {
@@ -1409,9 +1509,214 @@ RGY_ERR TSReplace::readTS(std::vector<uniqueRGYTSPacket>& packetBuffer) {
     return RGY_ERR_MORE_DATA;
 }
 
-RGY_ERR TSReplace::writePacket(const RGYTSPacket *pkt) {
-    if (_fwrite_nolock(pkt->data(), 1, pkt->datasize(), m_fpTSOut.get()) != pkt->datasize()) {
-        return RGY_ERR_OUT_OF_RESOURCES;
+// 出力用の非同期書き込みスレッドを初期化する
+// メイン処理スレッドから切り離して書き込むことで、ネットワークドライブの書き込みレイテンシと処理を重ねる
+RGY_ERR TSReplace::initOutputThread() {
+    if (m_threadOutputTS) {
+        return RGY_ERR_NONE;
+    }
+    m_outputError = RGY_ERR_NONE;
+    m_queueOutput = std::make_unique<RGYQueueBuffer>();
+    m_queueOutput->init(m_outputBlockSize * 2);
+    m_queueOutput->setMaxCapacity((int64_t)m_outputBlockSize * 4);
+    m_bufferOutput.reserve(m_outputBlockSize + 188 * 8);
+    AddMessage(RGY_LOG_DEBUG, _T("Create thread and queue for output.\n"));
+    m_threadOutputTS = std::make_unique<std::thread>([&]() {
+        std::vector<uint8_t> writeBuffer(m_outputBlockSize * 2);
+        int64_t bytes_read = 0;
+        while ((bytes_read = m_queueOutput->popDataBlock(writeBuffer.data(), (int64_t)writeBuffer.size())) >= 0) {
+            if (bytes_read == 0) {
+                continue;
+            }
+            if (_fwrite_nolock(writeBuffer.data(), 1, (size_t)bytes_read, m_fpTSOut.get()) != (size_t)bytes_read) {
+                m_outputError = RGY_ERR_OUT_OF_RESOURCES;
+                break;
+            }
+        }
+        AddMessage(RGY_LOG_DEBUG, _T("Finished output writer thread.\n"));
+    });
+    return RGY_ERR_NONE;
+}
+
+// 蓄積した出力バッファを書き込みキューへ送る
+RGY_ERR TSReplace::flushOutputBuffer() {
+    if (m_bufferOutput.empty()) {
+        return (RGY_ERR)m_outputError.load();
+    }
+    if (auto err = (RGY_ERR)m_outputError.load(); err != RGY_ERR_NONE) {
+        return err;
+    }
+    // キューが一杯の場合はpushDataがタイムアウトするので、書き込みエラーを確認しながらリトライする
+    while (!m_queueOutput->pushData(m_bufferOutput.data(), (int64_t)m_bufferOutput.size(), 1000)) {
+        if (auto err = (RGY_ERR)m_outputError.load(); err != RGY_ERR_NONE) {
+            return err;
+        }
+    }
+    m_bufferOutput.clear();
+    return (RGY_ERR)m_outputError.load();
+}
+
+RGY_ERR TSReplace::writePacket(RGYTSPacket *pkt) {
+    if (cutMode()) {
+        // CC は出力直前だけ書き換え、呼び出し元で packet を再利用しないため、buffer を直接更新する。
+        auto *data = pkt->packet.data();
+        for (size_t offset = 0; offset + 188 <= pkt->datasize(); offset += 188) {
+            m_ccRewriter.process(data + offset);
+        }
+    }
+    // 標準出力ではキューもスレッドも作らず、従来どおり即時に書き込む。
+    if (m_outputIsPipe) {
+        if (_fwrite_nolock(pkt->data(), 1, pkt->datasize(), m_fpTSOut.get()) != pkt->datasize()) {
+            return RGY_ERR_OUT_OF_RESOURCES;
+        }
+        return RGY_ERR_NONE;
+    }
+    if (auto err = (RGY_ERR)m_outputError.load(); err != RGY_ERR_NONE) {
+        return err;
+    }
+    // 出力スレッドは最初の書き込み時に起動する
+    if (!m_threadOutputTS) {
+        if (auto err = initOutputThread(); err != RGY_ERR_NONE) {
+            return err;
+        }
+    }
+    m_bufferOutput.insert(m_bufferOutput.end(), pkt->data(), pkt->data() + pkt->datasize());
+    // 188バイト単位の細切れ書き込みを避けるため、一定サイズまでまとめてからキューへ送る。
+    if (m_bufferOutput.size() >= m_outputBlockSize) {
+        return flushOutputBuffer();
+    }
+    return RGY_ERR_NONE;
+}
+
+namespace {
+
+bool splitPESHeaderAndPayload(const std::vector<uint8_t>& pesData,
+    std::vector<uint8_t>& pesHeader, std::vector<uint8_t>& esPayload) {
+    pesHeader.clear();
+    esPayload.clear();
+    if (pesData.size() < PES_HEADER_SIZE
+        || pesData[0] != 0x00 || pesData[1] != 0x00 || pesData[2] != 0x01
+        || !rgyPESStreamHasOptionalHeader(pesData[3])) {
+        return false;
+    }
+    const auto headerSize = PES_HEADER_SIZE + (size_t)pesData[8];
+    if (headerSize > pesData.size()) {
+        return false;
+    }
+    pesHeader.assign(pesData.begin(), pesData.begin() + headerSize);
+    esPayload.assign(pesData.begin() + headerSize, pesData.end());
+    return true;
+}
+
+} // namespace
+
+RGY_ERR TSReplace::finalizeHeldADTSPES(uint16_t pid, TSRPidCutState& state, bool truncateTail) {
+    if (state.heldPackets.empty()) {
+        if (truncateTail) {
+            state.adtsChain.reset();
+            state.resyncNeeded = true;
+        }
+        return RGY_ERR_NONE;
+    }
+
+    std::vector<uint8_t> pesHeader;
+    std::vector<uint8_t> esPayload;
+    if (!splitPESHeaderAndPayload(state.heldPESData, pesHeader, esPayload)) {
+        AddMessage(RGY_LOG_WARN, _T("PID 0x%04x: Failed to parse the audio PES header; dropping this PES.\n"), pid);
+        state.heldPackets.clear();
+        state.heldPESData.clear();
+        state.heldNeedsFrontTrim = false;
+        state.adtsChain.reset();
+        state.resyncNeeded = true;
+        return RGY_ERR_NONE;
+    }
+
+    bool modified = false;
+    if (state.heldNeedsFrontTrim) {
+        size_t syncOffset = 0;
+        if (!tsrFindADTSSync(esPayload.data(), esPayload.size(), syncOffset)) {
+            // cut 後の PES 全体が前フレームの孤児断片なら、次の PES でも再同期を続ける。
+            state.heldPackets.clear();
+            state.heldPESData.clear();
+            state.heldNeedsFrontTrim = false;
+            state.adtsChain.reset();
+            state.resyncNeeded = true;
+            return RGY_ERR_NONE;
+        }
+        if (syncOffset > 0) {
+            esPayload.erase(esPayload.begin(), esPayload.begin() + syncOffset);
+            modified = true;
+        }
+        state.adtsChain.reset();
+    }
+
+    const auto walk = tsrWalkADTSPayload(esPayload.data(), esPayload.size(), state.adtsChain);
+    if (!walk.valid) {
+        // 元ストリーム側で ADTS チェーンが壊れている場合は、次の PES から再同期する。
+        state.adtsChain.reset();
+        state.resyncNeeded = true;
+        if (truncateTail) {
+            state.heldPackets.clear();
+            state.heldPESData.clear();
+            state.heldNeedsFrontTrim = false;
+            return RGY_ERR_NONE;
+        }
+    }
+
+    if (truncateTail) {
+        // 次が drop PES だと判明した時点で、最後に完結した ADTS フレームより後ろを除く。
+        if (!walk.valid || walk.lastCompleteOffset == 0) {
+            state.heldPackets.clear();
+            state.heldPESData.clear();
+            state.heldNeedsFrontTrim = false;
+            state.adtsChain.reset();
+            state.resyncNeeded = true;
+            return RGY_ERR_NONE;
+        }
+        if (walk.lastCompleteOffset < esPayload.size()) {
+            esPayload.resize(walk.lastCompleteOffset);
+            modified = true;
+        }
+        state.adtsChain.reset();
+        state.resyncNeeded = true;
+    }
+
+    RGY_ERR err = RGY_ERR_NONE;
+    if (modified) {
+        std::vector<std::vector<uint8_t>> packets;
+        if (!tsrPacketizePES(pid, pesHeader, esPayload, packets)) {
+            AddMessage(RGY_LOG_WARN, _T("PID 0x%04x: Failed to repacketize the audio PES; dropping this PES.\n"), pid);
+            state.adtsChain.reset();
+            state.resyncNeeded = true;
+        } else {
+            for (auto& packetData : packets) {
+                RGYTSPacket packet = {};
+                packet.packet = std::move(packetData);
+                if ((err = writePacket(&packet)) != RGY_ERR_NONE) {
+                    break;
+                }
+            }
+        }
+    } else {
+        for (auto& packetData : state.heldPackets) {
+            RGYTSPacket packet = {};
+            packet.packet = std::move(packetData);
+            if ((err = writePacket(&packet)) != RGY_ERR_NONE) {
+                break;
+            }
+        }
+    }
+    state.heldPackets.clear();
+    state.heldPESData.clear();
+    state.heldNeedsFrontTrim = false;
+    return err;
+}
+
+RGY_ERR TSReplace::flushHeldADTSPES() {
+    for (auto& [pid, state] : m_pidCutState) {
+        if (auto err = finalizeHeldADTSPES(pid, state, false); err != RGY_ERR_NONE) {
+            return err;
+        }
     }
     return RGY_ERR_NONE;
 }
@@ -1461,6 +1766,24 @@ RGY_ERR TSReplace::writeTypeDPacket(RGYTSPacket *pkt) {
         previous->second = counter;
     }
     return writePacket(pkt);
+}
+
+int64_t TSReplace::srcRel(int64_t ts33) const {
+    return diffTimestampTsAMinusB(ts33, m_vidFirstFramePTS);
+}
+
+// source時間軸のtimestampを出力時間軸に変換する。
+// srcRel() 経由で m_vidFirstFramePTS に依存するため、cutMode() では
+// initDemuxer() の m_cut.resolve(m_vidFirstFramePTS) 完了後にのみ呼べる。
+int64_t TSReplace::mapToOutput(int64_t ts33) const {
+    if (ts33 == TIMESTAMP_INVALID_VALUE || !cutMode()) {
+        return ts33;
+    }
+    return (ts33 - m_cut.removedBefore(srcRel(ts33))) & ((int64_t{ 1 } << 33) - 1);
+}
+
+bool TSReplace::isCutTimestamp(int64_t ts33) const {
+    return cutMode() && ts33 != TIMESTAMP_INVALID_VALUE && m_cut.isCut(srcRel(ts33));
 }
 
 uint8_t TSReplace::getvideoDecCtrlEncodeFormat(const int height) {
@@ -1722,7 +2045,20 @@ uint8_t TSReplace::getAudValue(const AVPacket *pkt) const {
 }
 
 std::tuple<RGY_ERR, bool, bool> TSReplace::checkPacket(const AVPacket *pkt) {
-    if (m_videoReplace->getVidCodecID() == AV_CODEC_ID_H264) {
+    if (m_videoReplace->getVidCodecID() == AV_CODEC_ID_MPEG2VIDEO) {
+        // MPEG-2 VideoにはAUDがないため、シーケンスヘッダの有無だけを確認する。
+        bool has_sequence_header = false;
+        for (int i = 0; i + 3 < pkt->size; i++) {
+            if (pkt->data[i + 0] == 0x00
+                && pkt->data[i + 1] == 0x00
+                && pkt->data[i + 2] == 0x01
+                && pkt->data[i + 3] == 0xb3) {
+                has_sequence_header = true;
+                break;
+            }
+        }
+        return { RGY_ERR_NONE, false, has_sequence_header };
+    } else if (m_videoReplace->getVidCodecID() == AV_CODEC_ID_H264) {
         const auto nal_list = m_parseNalH264(pkt->data, pkt->size);
         const auto h264_aud_nal = std::find_if(nal_list.begin(), nal_list.end(), [](nal_info info) { return info.type == NALU_H264_AUD; });
         const auto h264_sps_nal = std::find_if(nal_list.begin(), nal_list.end(), [](nal_info info) { return info.type == NALU_H264_SPS; });
@@ -1752,13 +2088,15 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
         return err;
     }
     const bool replaceToHEVC = m_videoReplace->getVidCodecID() == AV_CODEC_ID_HEVC;
-    const bool addAud = m_addAud && !has_aud;
+    const bool replaceToMPEG2 = m_videoReplace->getVidCodecID() == AV_CODEC_ID_MPEG2VIDEO;
+    const bool addAud = m_addAud && !replaceToMPEG2 && !has_aud;
     const bool addHeader = m_addHeaders && isKey && !has_header;
-    const auto pts = av_rescale_q(avpkt->pts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestamp;
-    const auto dts = av_rescale_q(avpkt->dts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestamp;
+    // 置換映像のtimecodeはカット済みの出力時間軸なので、mapToOutput()を適用すると二重にカットされる。
+    const auto pts = av_rescale_q(avpkt->pts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestampOut;
+    const auto dts = av_rescale_q(avpkt->dts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestampOut;
 
     // 最後に出力した置換映像のPTSを記録 (EOF時の終了しきい値計算用)
-    m_lastReplaceVidPTS = pts;
+    m_lastReplaceVidPTSOut = pts;
 
     int add_aud_len = (addAud) ? ((replaceToHEVC) ? 7 : 6) : 0;
     const  uint8_t *header = nullptr;
@@ -1836,24 +2174,24 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
 }
 
 int64_t TSReplace::getOrigPtsOffset() {
-    if (m_vidDTS < m_vidDTSOutMax) {
-        if (m_vidDTSOutMax - m_vidDTS > WRAP_AROUND_CHECK_VALUE) {
+    if (m_vidDTSOut < m_vidDTSOutMax) {
+        if (m_vidDTSOutMax - m_vidDTSOut > WRAP_AROUND_CHECK_VALUE) {
             AddMessage(RGY_LOG_INFO, _T("PTS/DTS wrap!\n"));
             m_ptswrapOffset += WRAP_AROUND_VALUE;
-            m_vidDTSOutMax = m_vidDTS;
+            m_vidDTSOutMax = m_vidDTSOut;
         }
     } else {
-        if (m_vidDTS - m_vidDTSOutMax < WRAP_AROUND_CHECK_VALUE) {
-            m_vidDTSOutMax = m_vidDTS;
+        if (m_vidDTSOut - m_vidDTSOutMax < WRAP_AROUND_CHECK_VALUE) {
+            m_vidDTSOutMax = m_vidDTSOut;
         }
     }
     // dtsベースで差分を計算するが、起点は最初のPTSとする
-    auto offset = m_vidDTSOutMax + m_ptswrapOffset - m_vidFirstTimestamp;
+    auto offset = m_vidDTSOutMax + m_ptswrapOffset - m_vidFirstTimestampOut;
     return offset;
 }
 
 RGY_ERR TSReplace::writeReplacedVideo() {
-    if (m_vidFirstTimestamp == TIMESTAMP_INVALID_VALUE) {
+    if (m_vidFirstTimestampOut == TIMESTAMP_INVALID_VALUE) {
         return RGY_ERR_NONE;
     }
     const auto dtsOrigOffset = getOrigPtsOffset();
@@ -1863,11 +2201,11 @@ RGY_ERR TSReplace::writeReplacedVideo() {
             // 置換映像のEOF到達時に終了しきい値を設定
             if (err == RGY_ERR_MORE_DATA
                 && m_endAtReplaceEOF
-                && m_outputEndTimestamp == TIMESTAMP_INVALID_VALUE
-                && m_lastReplaceVidPTS != TIMESTAMP_INVALID_VALUE) {
-                m_outputEndTimestamp = m_lastReplaceVidPTS + (int64_t)m_eofCutDelayMs * (TS_TIMEBASE / 1000); // 90kHz単位;
-                AddMessage(RGY_LOG_INFO, _T("Replace EOF PTS: %11lld\n"), (long long)m_lastReplaceVidPTS);
-                AddMessage(RGY_LOG_DEBUG, _T("Set output end timestamp: %11lld (+%d ms).\n"), (long long)m_outputEndTimestamp, m_eofCutDelayMs);
+                && m_endTimestampOut == TIMESTAMP_INVALID_VALUE
+                && m_lastReplaceVidPTSOut != TIMESTAMP_INVALID_VALUE) {
+                m_endTimestampOut = m_lastReplaceVidPTSOut + (int64_t)m_eofCutDelayMs * (TS_TIMEBASE / 1000); // 90kHz単位;
+                AddMessage(RGY_LOG_INFO, _T("Replace EOF PTS: %11lld\n"), (long long)m_lastReplaceVidPTSOut);
+                AddMessage(RGY_LOG_DEBUG, _T("Set output end timestamp: %11lld (+%d ms).\n"), (long long)m_endTimestampOut, m_eofCutDelayMs);
             }
             return err;
         }
@@ -1882,11 +2220,11 @@ RGY_ERR TSReplace::writeReplacedVideo() {
             // getFrontPktAndPop()側でもEOF到達を検出しうるので、同様に終了しきい値を設定
             if (err2 == RGY_ERR_MORE_DATA
                 && m_endAtReplaceEOF
-                && m_outputEndTimestamp == TIMESTAMP_INVALID_VALUE
-                && m_lastReplaceVidPTS != TIMESTAMP_INVALID_VALUE) {
-                m_outputEndTimestamp = m_lastReplaceVidPTS + (int64_t)m_eofCutDelayMs * (TS_TIMEBASE / 1000); // 90kHz単位
-                AddMessage(RGY_LOG_INFO, _T("Replace EOF PTS: %11lld\n"), (long long)m_lastReplaceVidPTS);
-                AddMessage(RGY_LOG_DEBUG, _T("Set output end timestamp: %11lld (+%d ms).\n"), (long long)m_outputEndTimestamp, m_eofCutDelayMs);
+                && m_endTimestampOut == TIMESTAMP_INVALID_VALUE
+                && m_lastReplaceVidPTSOut != TIMESTAMP_INVALID_VALUE) {
+                m_endTimestampOut = m_lastReplaceVidPTSOut + (int64_t)m_eofCutDelayMs * (TS_TIMEBASE / 1000); // 90kHz単位
+                AddMessage(RGY_LOG_INFO, _T("Replace EOF PTS: %11lld\n"), (long long)m_lastReplaceVidPTSOut);
+                AddMessage(RGY_LOG_DEBUG, _T("Set output end timestamp: %11lld (+%d ms).\n"), (long long)m_endTimestampOut, m_eofCutDelayMs);
             }
             return err2;
         }
@@ -1899,6 +2237,11 @@ RGY_ERR TSReplace::writeReplacedVideo() {
 }
 
 int64_t TSReplace::getStartPointPTS() const {
+    // 先頭トリム(cut -1 <pts>)指定時は、出力開始点も置換映像の起点もカットリストが直接決めるので、
+    // --start-point / --replace-delay による推定は行わない。
+    if (m_replaceFirstPTS != TIMESTAMP_INVALID_VALUE) {
+        return m_replaceFirstPTS;
+    }
     switch (m_startPoint) {
     case TSRReplaceStartPoint::FirstPacket:    return m_vidFirstPacketPTS + m_replaceDelay;
     case TSRReplaceStartPoint::FirstFrame:     return m_vidFirstFramePTS + m_replaceDelay;
@@ -1992,8 +2335,11 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
     if (m_vidFirstPacketPTS < 0) m_vidFirstPacketPTS += WRAP_AROUND_VALUE;
     if (m_vidFirstFramePTS  < 0) m_vidFirstFramePTS  += WRAP_AROUND_VALUE;
     if (m_vidFirstKeyPTS    < 0) m_vidFirstKeyPTS    += WRAP_AROUND_VALUE;
-    // 出力開始点の計算 (最初に時刻を取得できたパケット + replace-delay)
-    m_outputStartTimestamp = m_vidFirstPacketPTS + m_replaceDelay;
+    // 出力開始点の計算
+    // 先頭トリム指定時はその絶対PTSをそのまま使う。未指定なら従来通り(最初に時刻を取得できたパケット + replace-delay)。
+    m_startTimestampSrc = (headTrimPTS() != TIMESTAMP_INVALID_VALUE)
+        ? headTrimPTS()
+        : m_vidFirstPacketPTS + m_replaceDelay;
     // 読み込み側に解析の終了を通知
     originalTS.reset();
     m_preAnalysisFin.store(true);
@@ -2007,8 +2353,44 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
     AddMessage(RGY_LOG_INFO, _T("%s First key    PTS: %11lld [%+7.1f ms] [%+7.1f ms]\n"),
         (m_startPoint == TSRReplaceStartPoint::KeyframPts) ? _T("*") : _T(" "),
         m_vidFirstKeyPTS, (m_vidFirstKeyPTS - m_vidFirstPacketPTS) * 1000.0 / (double)TS_TIMEBASE, (m_vidFirstKeyPTS - m_vidFirstFramePTS) * 1000.0 / (double)TS_TIMEBASE);
-    if (m_replaceDelay > 0) {
-        AddMessage(RGY_LOG_INFO, _T("  Output start PTS: %11lld (delay %lld [%+7.1f ms])\n"), (long long)m_outputStartTimestamp, (long long)m_replaceDelay, m_replaceDelay * 1000.0 / (double)TS_TIMEBASE);
+    if (cutMode()) {
+        if (const auto err = m_cut.resolve(m_vidFirstFramePTS); err != RGY_ERR_NONE) {
+            AddMessage(RGY_LOG_ERROR, _T("Failed to resolve cut list ranges: %s\n"), m_cut.loadError().c_str());
+            return err;
+        }
+        AddMessage(RGY_LOG_INFO, _T("Loaded %d cut ranges, total cut: %.3f sec\n"),
+            (int)m_cut.absoluteRanges().size(), m_cut.totalRemoved() / (double)TS_TIMEBASE);
+        AddMessage(RGY_LOG_INFO, _T("  Cut resolve  PTS: %11lld (first-frame)\n"), (long long)m_vidFirstFramePTS);
+        for (const auto& range : m_cut.absoluteRanges()) {
+            const auto start = diffTimestampTsAMinusB(range.start, m_vidFirstFramePTS);
+            const auto end = diffTimestampTsAMinusB(range.end, m_vidFirstFramePTS);
+            AddMessage(RGY_LOG_INFO, _T("  cut %lld - %lld (%s - %s)\n"),
+                (long long)range.start, (long long)range.end,
+                formatTimestampOffset(start).c_str(), formatTimestampOffset(end).c_str());
+        }
+        if (headTrimPTS() != TIMESTAMP_INVALID_VALUE) {
+            AddMessage(RGY_LOG_INFO, _T("  head trim %lld (%s)\n"), (long long)headTrimPTS(),
+                formatTimestampOffset(diffTimestampTsAMinusB(headTrimPTS(), m_vidFirstFramePTS)).c_str());
+        }
+        if (tailTrimPTS() != TIMESTAMP_INVALID_VALUE) {
+            AddMessage(RGY_LOG_INFO, _T("  tail trim %lld (%s)\n"), (long long)tailTrimPTS(),
+                formatTimestampOffset(diffTimestampTsAMinusB(tailTrimPTS(), m_vidFirstFramePTS)).c_str());
+        }
+        const auto startRel = diffTimestampTsAMinusB(m_startTimestampSrc, m_vidFirstFramePTS);
+        for (const auto& range : m_cut.ranges()) {
+            if (range.end <= startRel) {
+                AddMessage(RGY_LOG_WARN, _T("Cut range [%lld, %lld) ends before the output start point (%lld), possibly overlapping with the output start point.\n"),
+                    (long long)range.start, (long long)range.end, (long long)startRel);
+            }
+        }
+    }
+    AddMessage(RGY_LOG_INFO, _T("  Replace origin PTS: %11lld (%s)\n"),
+        (long long)getStartPointPTS(),
+        (m_replaceFirstPTS != TIMESTAMP_INVALID_VALUE) ? _T("head-trim") : _T("start-point"));
+    if (headTrimPTS() != TIMESTAMP_INVALID_VALUE) {
+        AddMessage(RGY_LOG_INFO, _T("  Output start PTS: %11lld (head-trim)\n"), (long long)m_startTimestampSrc);
+    } else if (m_replaceDelay > 0) {
+        AddMessage(RGY_LOG_INFO, _T("  Output start PTS: %11lld (delay %lld [%+7.1f ms])\n"), (long long)m_startTimestampSrc, (long long)m_replaceDelay, m_replaceDelay * 1000.0 / (double)TS_TIMEBASE);
     }
     if (getStartPointPTS() == TIMESTAMP_INVALID_VALUE) {
         AddMessage(RGY_LOG_ERROR, _T("Failed to get first timestamp.\n"));
@@ -2016,7 +2398,7 @@ RGY_ERR TSReplace::initDemuxer(std::vector<uniqueRGYTSPacket>& tsPackets) {
     }
 
     pat = nullptr;
-    m_vidFirstTimestamp = TIMESTAMP_INVALID_VALUE;
+    m_vidFirstTimestampOut = TIMESTAMP_INVALID_VALUE;
     m_demuxer->resetPCR();
     m_demuxer->resetPSICache();
     return RGY_ERR_NONE;
@@ -2198,14 +2580,20 @@ RGY_ERR TSReplace::restruct() {
     uniqueRGYTSPacket patPacket(nullptr, RGYTSPacketDeleter(nullptr));
 
     // 出力状態の初期化
-    auto outputState = (!m_trimOnly && m_replaceDelay > 0 && m_outputStartTimestamp != TIMESTAMP_INVALID_VALUE) ? TSROutputState::Cutting : TSROutputState::Output;
+    auto outputState = (!m_trimOnly && trimHead() && m_startTimestampSrc != TIMESTAMP_INVALID_VALUE) ? TSROutputState::Cutting : TSROutputState::Output;
     bool replaceDelayOutputAudioStarted = false; // m_replaceDelay > 0の場合に、音声出力を開始したかどうかのフラグ
+    bool warnedADTSAudioPCR = false;
 
     //本解析
     for (;;) {
         if (tsPackets.empty()) {
             auto err = readTS(tsPackets);
             if (err != RGY_ERR_NONE) {
+                if (err == RGY_ERR_MORE_DATA) {
+                    if (auto flushErr = flushHeldADTSPES(); flushErr != RGY_ERR_NONE) {
+                        return flushErr;
+                    }
+                }
                 return err;
             }
         }
@@ -2238,21 +2626,43 @@ RGY_ERR TSReplace::restruct() {
             }
             const bool removeTypeD = shouldRemoveTypeD(curTimestamp);
 
+            // 末尾トリム: 元TS上の絶対PTSで直接判定する (置換映像のEOFに依存しない)
+            if (outputState == TSROutputState::Output
+                && tailTrimPTS() != TIMESTAMP_INVALID_VALUE
+                && curTimestamp != TIMESTAMP_INVALID_VALUE
+                && diffTimestampTsAMinusB(curTimestamp, tailTrimPTS()) >= 0) {
+                AddMessage(RGY_LOG_DEBUG, _T("Stop output at timestamp %11lld (>= tail trim %11lld).\n"),
+                    (long long)curTimestamp, (long long)tailTrimPTS());
+                // curTimestampは音声など映像以外のPESでも更新されるため、この時点では置換映像の
+                // 書き出しが末尾トリム位置まで届いていないことがある。末尾まで書き切ってから終了する。
+                m_vidDTSOutMax = mapToOutput(tailTrimPTS());
+                if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
+                    return err;
+                }
+                if (auto err = flushHeldADTSPES(); err != RGY_ERR_NONE) {
+                    return err;
+                }
+                return RGY_ERR_NONE;
+            }
+
             // 映像EOF+マージンを超えたら出力を打ち切る (PTS wrap を考慮)
             if (outputState == TSROutputState::Output
                 && !m_trimOnly
                 && m_endAtReplaceEOF
-                && m_outputEndTimestamp != TIMESTAMP_INVALID_VALUE
+                && m_endTimestampOut != TIMESTAMP_INVALID_VALUE
                 && curTimestamp != TIMESTAMP_INVALID_VALUE
-                && diffTimestampTsAMinusB(curTimestamp, m_outputEndTimestamp) > 0) {
+                && diffTimestampTsAMinusB(mapToOutput(curTimestamp), m_endTimestampOut) > 0) {
                 AddMessage(RGY_LOG_DEBUG, _T("Stop output at timestamp %11lld (>= EOF+margin %11lld).\n"),
-                    (long long)curTimestamp, (long long)m_outputEndTimestamp);
+                    (long long)mapToOutput(curTimestamp), (long long)m_endTimestampOut);
+                if (auto err = flushHeldADTSPES(); err != RGY_ERR_NONE) {
+                    return err;
+                }
                 return RGY_ERR_NONE;
             }
 
             if (outputState == TSROutputState::Cutting) {
                 if (curTimestamp == TIMESTAMP_INVALID_VALUE  // まだ開始点が決められないので、解析のみ行い出力はしない
-                    || curTimestamp < m_outputStartTimestamp) { // まだ開始点に達していないので、解析のみ行い出力はしない
+                    || curTimestamp < m_startTimestampSrc) { // まだ開始点に達していないので、解析のみ行い出力はしない
                     if (ret.type == RGYTSPacketType::PAT) {
                         pat = m_demuxer->pat();
                         patPacket = std::move(tspkt);
@@ -2293,14 +2703,14 @@ RGY_ERR TSReplace::restruct() {
                     }
                     pmtResult.reset();
                     if (m_startPoint == TSRReplaceStartPoint::FirstPacket) {
-                        m_vidDTSOutMax = m_vidFirstTimestamp = getStartPointPTS();
+                        m_vidDTSOutMax = m_vidFirstTimestampOut = mapToOutput(getStartPointPTS());
                         if (!m_trimOnly) {
                             if (auto err2 = writeReplacedVideo(); (err2 != RGY_ERR_NONE && err2 != RGY_ERR_MORE_DATA)) {
                                 return err2;
                             }
                         }
+                        }
                     }
-                }
             } else if (m_trimOnly && ret.type == RGYTSPacketType::PMT && ret.programNumber > 0) {
                 if (ret.psi && ret.psi->version_number) {
                     if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, false); err != RGY_ERR_NONE) {
@@ -2313,6 +2723,17 @@ RGY_ERR TSReplace::restruct() {
                     switch (ret.type) {
                     case RGYTSPacketType::PMT:
                         service = m_demuxer->service();
+                        if (!warnedADTSAudioPCR && cutMode() && service != nullptr
+                            && service->pidPcr > 0
+                            && ((service->aud0.stream.type == RGYTSStreamType::ADTS_TRANSPORT
+                                    && service->pidPcr == service->aud0.stream.pid)
+                                || (service->aud1.stream.type == RGYTSStreamType::ADTS_TRANSPORT
+                                    && service->pidPcr == service->aud1.stream.pid))) {
+                            AddMessage(RGY_LOG_WARN,
+                                _T("PCR shares audio PID 0x%04x; ADTS frame boundary alignment is disabled.\n"),
+                                service->pidPcr);
+                            warnedADTSAudioPCR = true;
+                        }
                         if (ret.psi && ret.psi->version_number) {
                             if (auto err = writeReplacedPMT(ret, tspkt->header.PID, removeTypeD, true); err != RGY_ERR_NONE) {
                                 return err;
@@ -2335,8 +2756,21 @@ RGY_ERR TSReplace::restruct() {
                             }
                         }
                         if (!m_trimOnly && m_pcrPIDReplace) {
-                            writeReplacedPCR(ret.pcr);
-                        } else {
+                            if (!isCutTimestamp(ret.pcr)) {
+                                writeReplacedPCR(mapToOutput(ret.pcr));
+                            }
+                        } else if (!isCutTimestamp(pcr)) {
+                            if (cutMode()) {
+                                auto *packet = tspkt->packet.data();
+                                const auto pcrBase = tsPacketReadPCRBase(packet);
+                                if (pcrBase >= 0) {
+                                    tsPacketWritePCRBase(packet, mapToOutput(pcrBase));
+                                }
+                                const auto opcrBase = tsPacketReadOPCRBase(packet);
+                                if (opcrBase >= 0) {
+                                    tsPacketWriteOPCRBase(packet, mapToOutput(opcrBase));
+                                }
+                            }
                             writePacket(tspkt.get());
                         }
                         break;
@@ -2347,24 +2781,18 @@ RGY_ERR TSReplace::restruct() {
                             break;
                         }
                         // PCRが映像のストリームに含まれる場合は、別PIDで独立したPCRパケットを生成する
-                        if (m_pcrPIDReplace && ret.pcr != TIMESTAMP_INVALID_VALUE) {
-                            writeReplacedPCR(ret.pcr);
+                        if (m_pcrPIDReplace && ret.pcr != TIMESTAMP_INVALID_VALUE && !isCutTimestamp(ret.pcr)) {
+                            writeReplacedPCR(mapToOutput(ret.pcr));
                         }
                         if (tspkt->header.PayloadStartFlag) {
-                            m_vidPTS = ret.pts;
-                            m_vidDTS = ret.dts;
+                            m_vidDTSOut = mapToOutput(ret.dts);
                             if (m_vidFirstFramePTS == TIMESTAMP_INVALID_VALUE) {
-                                m_vidFirstFramePTS = m_vidPTS;
+                                m_vidFirstFramePTS = ret.pts;
                                 //AddMessage(RGY_LOG_INFO, _T("First Video PTS:     %11lld\n"), m_vidFirstFramePTS);
                             }
-                            if (m_vidFirstFrameDTS == TIMESTAMP_INVALID_VALUE) {
-                                m_vidFirstFrameDTS = m_vidDTS;
-                                //AddMessage(RGY_LOG_DEBUG, _T("First Video DTS:     %11lld\n"), m_vidFirstFrameDTS);
-                            }
-                            if (m_vidFirstTimestamp == TIMESTAMP_INVALID_VALUE) {
-                                const auto startPoint = getStartPointPTS();
-                                if (startPoint <= m_vidPTS) {
-                                    m_vidDTSOutMax = m_vidFirstTimestamp = getStartPointPTS();
+                            if (m_vidFirstTimestampOut == TIMESTAMP_INVALID_VALUE) {
+                                if (getStartPointPTS() <= ret.pts) { // どちらもsource時間軸
+                                    m_vidDTSOutMax = m_vidFirstTimestampOut = mapToOutput(getStartPointPTS());
                                 }
                             }
                         }
@@ -2380,7 +2808,7 @@ RGY_ERR TSReplace::restruct() {
                             }
                         } else {
                             bool outputPkt = true;
-                            if (!m_trimOnly && m_replaceDelay > 0 && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
+                            if (!m_trimOnly && trimHead() && ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT) {
                                 if (!replaceDelayOutputAudioStarted) {
                                     // まだ出力を開始していない音声
                                     const auto audioSampleThreshold = 1024 * TS_TIMEBASE / 48000;
@@ -2390,6 +2818,66 @@ RGY_ERR TSReplace::restruct() {
                                     } else {
                                         outputPkt = false;
                                     }
+                                }
+                            }
+                            if (cutMode() && service != nullptr
+                                && tsrIsPESCutTargetPID(tspkt->header.PID,
+                                    service->aud0.stream.pid, service->aud1.stream.pid,
+                                    service->cap.stream.pid, service->pidSuperimpose)) {
+                                auto& state = m_pidCutState[tspkt->header.PID];
+                                const auto isADTSAudio = ret.stream.type == RGYTSStreamType::ADTS_TRANSPORT
+                                    && tspkt->header.PID != service->pidPcr
+                                    && ((service->aud0.stream.pid > 0 && tspkt->header.PID == service->aud0.stream.pid)
+                                        || (service->aud1.stream.pid > 0 && tspkt->header.PID == service->aud1.stream.pid));
+                                if (tspkt->header.PayloadStartFlag) {
+                                    const auto referenceTimestamp = tsrPESCutReferenceTimestamp(ret.pts, curTimestamp);
+                                    auto keepPES = outputPkt && (referenceTimestamp == TIMESTAMP_INVALID_VALUE
+                                        || !isCutTimestamp(referenceTimestamp));
+                                    if (keepPES && ret.pts != TIMESTAMP_INVALID_VALUE) {
+                                        auto *packet = tspkt->packet.data();
+                                        if (!tsPacketRewritePESTimestamps(packet, tspkt->datasize(),
+                                            mapToOutput(ret.pts), mapToOutput(ret.dts))) {
+                                            AddMessage(RGY_LOG_WARN, _T("PID 0x%04x: Failed to rewrite timestamps in the PES header; dropping this PES.\n"),
+                                                tspkt->header.PID);
+                                            keepPES = false;
+                                        }
+                                    }
+                                    if (isADTSAudio) {
+                                        // 最後の keep PES かは次の PUSI で初めて分かるため、ここで直前 PES を確定する。
+                                        if (auto err = finalizeHeldADTSPES(tspkt->header.PID, state, !keepPES); err != RGY_ERR_NONE) {
+                                            return err;
+                                        }
+                                    }
+                                    state.seenPUSI = true;
+                                    state.keepPES = keepPES;
+                                    if (isADTSAudio) {
+                                        if (state.keepPES) {
+                                            state.heldNeedsFrontTrim = state.resyncNeeded;
+                                            state.resyncNeeded = false;
+                                        } else {
+                                            state.adtsChain.reset();
+                                            state.resyncNeeded = true;
+                                        }
+                                    }
+                                }
+                                if (!state.seenPUSI) {
+                                    state.keepPES = false;
+                                }
+                                if (isADTSAudio) {
+                                    if (state.keepPES) {
+                                        // PTS はこの PES 内で開始する最初の access unit を指すため、
+                                        // cut 後に先頭の孤児断片を除いても追加補正はしない。
+                                        state.heldPackets.push_back(tspkt->packet);
+                                        if (tspkt->header.payloadSize > 0) {
+                                            const auto *payload = tspkt->payload();
+                                            state.heldPESData.insert(state.heldPESData.end(),
+                                                payload, payload + tspkt->header.payloadSize);
+                                        }
+                                    }
+                                    // 音声は 1 PES ホールドバック経路からのみ出力する。
+                                    outputPkt = false;
+                                } else if (!state.keepPES) {
+                                    outputPkt = false;
                                 }
                             }
                             if (outputPkt) {
@@ -2417,7 +2905,11 @@ RGY_ERR TSReplace::restruct() {
                         writeTypeDPacket(tspkt.get());
                     }
                 } else {
-                    writePacket(tspkt.get());
+                    // timestamp を持たない SI packet は、直近の source clock でカット判定する。
+                    // PCR が未確定なら安全側として出力する。
+                    if (!cutMode() || curTimestamp == TIMESTAMP_INVALID_VALUE || !isCutTimestamp(curTimestamp)) {
+                        writePacket(tspkt.get());
+                    }
                 }
             }
         }
@@ -2466,6 +2958,7 @@ static void show_help() {
         _T("                                 keyframe, firstframe, firstpacket\n")
         _T("   --replace-delay <int>        cut packets until (first timestamp + delay)\n")
         _T("   --end-at-replace-eof [<int>] stop output around replace EOF (+margin ms)\n")
+        _T("   --cut-list <filename>        set cm cut list file\n")
 
         _T("   --(no-)add-aud               auto insert aud unit\n")
         _T("   --(no-)add-headers           auto insert headers\n")
@@ -2479,7 +2972,7 @@ static void show_help() {
         _T("   --log <filename>             set log file\n")
         _T("   --log-level <string>         set log level\n")
         _T("                                 debug, info(default), warn, error\n");
-     
+
     _ftprintf(stdout, _T("%s\n"), str.c_str());
 }
 
@@ -2608,6 +3101,11 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
         prm.replacefileformat = strInput[i];
         return 0;
     }
+    if (IS_OPTION("cut-list")) {
+        i++;
+        prm.cutList = strInput[i];
+        return 0;
+    }
     if (IS_OPTION("start-point")) {
         i++;
         if (int value = get_value_from_chr(list_startpoint, strInput[i]); value != PARSE_ERROR_FLAG) {
@@ -2676,10 +3174,12 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
     }
     if (IS_OPTION("remove-typed")) {
         prm.removeTypeDMode = TSRRemoveTypeDMode::All;
+        prm.removeTypeDExplicitlyDisabled = false;
         return 0;
     }
     if (IS_OPTION("smart-remove-typed")) {
         prm.removeTypeDMode = TSRRemoveTypeDMode::Smart;
+        prm.removeTypeDExplicitlyDisabled = false;
         return 0;
     }
     if (IS_OPTION("smart-remove-typed-duration")) {
@@ -2696,6 +3196,7 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
             }
             prm.smartRemoveTypeDDuration = (int64_t)std::llround(durationSec * SMART_REMOVE_TYPED_TIMEBASE);
             prm.removeTypeDMode = TSRRemoveTypeDMode::Smart;
+            prm.removeTypeDExplicitlyDisabled = false;
         } catch (...) {
             _ftprintf(stderr, _T("Unknown value for --%s: \"%s\"\n"), option_name, strInput[i]);
             return 1;
@@ -2704,6 +3205,7 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
     }
     if (IS_OPTION("no-remove-typed")) {
         prm.removeTypeDMode = TSRRemoveTypeDMode::Disabled;
+        prm.removeTypeDExplicitlyDisabled = true;
         return 0;
     }
     if (IS_OPTION("service")) {
@@ -2861,6 +3363,10 @@ int _tmain(const int argc, const TCHAR **argv) {
         return 1;
     }
     const bool trimOnly = prm.replacefile.empty() && prm.encoderPath.empty();
+    if (trimOnly && !prm.cutList.empty()) {
+        _ftprintf(stderr, _T("ERROR: --cut-list requires video replacement.\n"));
+        return 1;
+    }
     if (trimOnly && prm.removeTypeDMode == TSRRemoveTypeDMode::Disabled) {
         _ftprintf(stderr, _T("ERROR: replace video file, encoder path, or a Type-D trim option must be set.\n"));
         return 1;

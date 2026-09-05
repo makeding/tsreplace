@@ -1,5 +1,5 @@
 project('tsreplace', ['c', 'cpp'],
-  version: run_command('git', 'describe', '--tags', '--abbrev=0', check: true).stdout().strip(),
+  version: run_command('bash', 'scripts/get-version.sh', check: true).stdout().strip(),
   license: 'MIT',
   meson_version: '>=0.61.0',
   default_options: [
@@ -177,6 +177,7 @@ tsreplace_sources = files(
   'app/rgy_pipe_linux.cpp',
   'app/rgy_simd.cpp',
   'app/rgy_tsdemux.cpp',
+  'app/rgy_tscut.cpp',
   'app/rgy_tsstruct.cpp',
   'app/rgy_tsutil.cpp',
   'app/rgy_util.cpp',
@@ -227,6 +228,25 @@ executable('tsreplace',
   link_with: simd_libs,
   install: true,
 )
+
+tscut_test_deps = []
+if stdcxxfs_dep.found()
+  tscut_test_deps += stdcxxfs_dep
+endif
+
+tscut_test = executable('rgy_tscut_test',
+  files(
+    'app/rgy_bitstream_aac.cpp',
+    'app/rgy_tscut.cpp',
+    'app/rgy_tscut_test.cpp',
+  ),
+  cpp_args: common_cpp_args,
+  include_directories: common_include_dirs,
+  dependencies: tscut_test_deps,
+  link_args: static_runtime_link_args,
+)
+
+test('rgy_tscut', tscut_test)
 
 summary({
   'FFmpeg static deps': libav_static,

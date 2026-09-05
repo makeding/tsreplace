@@ -116,6 +116,7 @@ RGYTSDemuxer::RGYTSDemuxer() :
     m_audio1Mode(0),
     m_captionMode(0),
     m_superimposeMode(0),
+    m_parsePESTimestampAllStreams(false),
     m_log(),
     m_pat(),
     m_patPsi(),
@@ -126,7 +127,7 @@ RGYTSDemuxer::RGYTSDemuxer() :
 }
 
 RGYTSDemuxer::~RGYTSDemuxer() {
-    
+
 }
 
 RGY_ERR RGYTSDemuxer::init(std::shared_ptr<RGYLog> log, int selectService) {
@@ -416,6 +417,7 @@ RGYTSPESHeader RGYTSDemuxer::parsePESHeader(const std::vector<uint8_t>& pkt) {
     pes.pts = TIMESTAMP_INVALID_VALUE;
     pes.dts = TIMESTAMP_INVALID_VALUE;
     static uint8_t PES_START_CODE[3] = { 0x00, 0x00, 0x01 };
+    const uint8_t *const pkt_fin = pkt.data() + pkt.size();
     const uint8_t *pes_header = nullptr;
     for (size_t i = 4; i + sizeof(PES_START_CODE) <= pkt.size(); i++) {
         if (memcmp(pkt.data() + i, PES_START_CODE, sizeof(PES_START_CODE)) == 0) {
@@ -426,11 +428,12 @@ RGYTSPESHeader RGYTSDemuxer::parsePESHeader(const std::vector<uint8_t>& pkt) {
     if (!pes_header || (size_t)(pkt.data() + pkt.size() - pes_header) < PES_HEADER_SIZE) {
         return pes;
     }
+    // 以降、pes_headerがパケット末尾付近で見つかった場合に範囲外参照しないよう、都度残りサイズを確認する
     const uint8_t *ptr = pes_header;
     const size_t available = pkt.data() + pkt.size() - pes_header;
     pes.stream_id = ptr[3];
     pes.pes_len = read16(ptr + 4);
-    if ((ptr[6] & 0xC0) == (0x80)) {
+    if (pkt_fin - ptr >= PES_HEADER_SIZE && rgyPESStreamHasOptionalHeader((uint8_t)pes.stream_id) && (ptr[6] & 0xC0) == (0x80)) {
         pes.scramble                  = (ptr[6] & 0x30) >> 8;
         pes.priority                  = (ptr[6] & 0x08) != 0;
         pes.data_align                = (ptr[6] & 0x04) != 0;
@@ -682,7 +685,7 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
             result.type = RGYTSPacketType::PCR;
             result.pcr = pcr;
             // PCRが他のストリームに含まれる場合は、PCRが取得できなくても異常ではない
-            const auto pcrMuxedWithOtherStream = 
+            const auto pcrMuxedWithOtherStream =
                    packetHeader.PID == service->service.vid.stream.pid
                 || packetHeader.PID == service->service.aud0.stream.pid
                 || packetHeader.PID == service->service.aud1.stream.pid
@@ -707,10 +710,24 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
                 result.pts = pes.pts;
                 result.dts = pes.dts;
             }
+        } else if (m_parsePESTimestampAllStreams && packetHeader.PID == service->service.aud1.stream.pid) {
+            if (packetHeader.PayloadStartFlag) {
+                auto pes = parsePESHeader(pkt->packet);
+                AddMessage(RGY_LOG_TRACE, _T("  pid aud1 0x%04x, %lld\n"), packetHeader.PID, pes.pts);
+                result.pts = pes.pts;
+                result.dts = pes.dts;
+            }
         } else if (packetHeader.PID == service->service.cap.stream.pid) {
             if (packetHeader.PayloadStartFlag) {
                 auto pes = parsePESHeader(pkt->packet);
                 AddMessage(RGY_LOG_TRACE, _T("  pid cap  0x%04x, %lld\n"), service->service.vid.stream.pid, pes.pts);
+                result.pts = pes.pts;
+                result.dts = pes.dts;
+            }
+        } else if (m_parsePESTimestampAllStreams && packetHeader.PID == service->service.pidSuperimpose) {
+            if (packetHeader.PayloadStartFlag) {
+                auto pes = parsePESHeader(pkt->packet);
+                AddMessage(RGY_LOG_TRACE, _T("  pid superimpose 0x%04x, %lld\n"), packetHeader.PID, pes.pts);
                 result.pts = pes.pts;
                 result.dts = pes.dts;
             }

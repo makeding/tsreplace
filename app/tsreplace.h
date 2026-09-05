@@ -35,7 +35,9 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <unordered_map>
 #include "rgy_tsdemux.h"
+#include "rgy_tscut.h"
 #include "rgy_avutil.h"
 #include "rgy_pipe.h"
 #include "rgy_queue.h"
@@ -208,6 +210,7 @@ struct TSRReplaceParams {
     tstring replacefileformat;
     tstring output;
     tstring logfile;
+    tstring cutList;
     TSRReplaceStartPoint startpoint;
     int64_t replaceDelay;
     bool endAtReplaceEOF;
@@ -218,12 +221,24 @@ struct TSRReplaceParams {
     bool addHeaders;
     TSRRemoveTypeDMode removeTypeDMode;
     int64_t smartRemoveTypeDDuration;
+    bool removeTypeDExplicitlyDisabled;
     bool removeNonTargetService;
     int selectService;
     bool copyFileTs;
 
 
     TSRReplaceParams();
+};
+
+struct TSRPidCutState {
+    bool keepPES = false;
+    bool seenPUSI = false;
+    // 音声は次の PUSI で cut 境界が確定するため、1 PES だけ出力を保留する。
+    std::vector<std::vector<uint8_t>> heldPackets;
+    std::vector<uint8_t> heldPESData;
+    TSRADTSChainState adtsChain;
+    bool heldNeedsFrontTrim = false;
+    bool resyncNeeded = true;
 };
 
 class TSReplace {
@@ -250,10 +265,14 @@ protected:
     EncoderType getEncoderType();
     RGY_ERR initEncoder();
     RGY_ERR readTS(std::vector<uniqueRGYTSPacket>& packetBuffer);
-    RGY_ERR writePacket(const RGYTSPacket *pkt);
+    RGY_ERR initOutputThread();     // ファイル出力用の非同期書き込みスレッドを初期化する
+    RGY_ERR flushOutputBuffer();    // 蓄積した出力バッファを書き込みキューへ送る
+    RGY_ERR writePacket(RGYTSPacket *pkt);
     RGY_ERR writeTypeDPacket(RGYTSPacket *pkt);
     bool shouldDropTypeDPacket(const RGYTSPacket *pkt, bool removeTypeD);
     void markTypeDPacketRemoved(const RGYTSPacket *pkt);
+    RGY_ERR finalizeHeldADTSPES(uint16_t pid, TSRPidCutState& state, bool truncateTail);
+    RGY_ERR flushHeldADTSPES();
     RGY_ERR writeReplacedPCR(const uint64_t pcr);
     RGY_ERR writeReplacedPAT(const RGYTS_PAT *pat);
     RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, bool removeTypeD, bool replaceVideo);
@@ -268,6 +287,15 @@ protected:
     int64_t getStartPointPTS() const;
     RGY_ERR setSmartRemoveTypeDDuration(int64_t duration);
     bool shouldRemoveTypeD(int64_t timestamp) const;
+    bool cutMode() const { return m_cut.enabled(); }
+    // カットリストの先頭/末尾トリム。未指定時とcut mode以外では TIMESTAMP_INVALID_VALUE。
+    int64_t headTrimPTS() const { return cutMode() ? m_cut.headTrimPTS() : TIMESTAMP_INVALID_VALUE; }
+    int64_t tailTrimPTS() const { return cutMode() ? m_cut.tailTrimPTS() : TIMESTAMP_INVALID_VALUE; }
+    // 出力開始点まで頭を落とすモードか (--replace-delay または カットリストの先頭トリム)
+    bool trimHead() const { return m_replaceDelay > 0 || headTrimPTS() != TIMESTAMP_INVALID_VALUE; }
+    int64_t srcRel(int64_t ts33) const;
+    int64_t mapToOutput(int64_t ts33) const;
+    bool isCutTimestamp(int64_t ts33) const;
 
     void AddMessage(RGYLogLevel log_level, const tstring &str) {
         if (m_log == nullptr || log_level < m_log->getLogLevel(RGY_LOGT_APP)) {
@@ -307,8 +335,15 @@ protected:
     std::unique_ptr<RGYTSPacketSplitter> m_tsPktSplitter; // ts読み込み時ののpacket分割用
     std::unique_ptr<FILE, fp_deleter> m_fpTSIn;  // 入力tsファイル
     std::unique_ptr<FILE, fp_deleter> m_fpTSOut; // 出力tsファイル
+    std::vector<char> m_fpTSOutStdioBuf; // 出力ファイルのstdioバッファ (setvbuf用)
     std::atomic<bool> m_inputAbort; // 入力スレッドの終了要求
     std::unique_ptr<std::thread> m_threadInputTS; // オリジナルts読み込みスレッド
+    std::unique_ptr<std::thread> m_threadOutputTS; // ファイル出力用の書き込みスレッド
+    std::unique_ptr<RGYQueueBuffer> m_queueOutput; // ファイル出力用の書き込みキュー
+    std::vector<uint8_t> m_bufferOutput; // 出力TSをブロック単位にまとめるバッファ
+    size_t m_outputBlockSize; // ファイル出力をまとめる単位
+    bool m_outputIsPipe; // 出力先が標準出力かどうか
+    std::atomic<RGY_ERR> m_outputError; // 出力スレッドで発生したエラー
     std::unique_ptr<std::thread> m_threadSendEncoder; // tsからエンコーダへの送信スレッド
     std::unique_ptr<RGYQueueBuffer> m_queueInputReplace; // tsreplaceの読み込み用
     std::unique_ptr<RGYQueueBuffer> m_queueInputEncoder; // エンコーダの読み込み用
@@ -317,14 +352,18 @@ protected:
     std::atomic<bool> m_preAnalysisFin; // 事前解析の終了
     uint16_t m_vidPIDReplace;   // 出力tsの動画のPID上書き用
     uint16_t m_pcrPIDReplace;   // 出力tsのPCRのPID上書き用
-    int64_t m_vidDTSOutMax;     // 動画フレームのDTS最大値(出力制御用)
-    int64_t m_vidPTS;           // 直前の動画フレームのPTS
-    int64_t m_vidDTS;           // 直前の動画フレームのDTS
+    // [timestampメンバの時間軸の命名規則]
+    // 途中区間カット時は「元TSの時間軸(source)」と「カット後の時間軸(出力)」の2つが存在し、
+    // 変換は mapToOutput() による source → 出力 の一方向のみ (--cut-list なしなら両者は一致する)。
+    // 出力時間軸で保持するメンバは名前を "Out" で終える。
+    // "Out" が付かないtimestampメンバは全てsource時間軸 (紛らわしい箇所には "Src" を付す)。
+    // 比較・演算は必ず同じ時間軸同士で行うこと。
+    int64_t m_vidDTSOutMax;     // 動画フレームDTS最大値(出力制御用)
+    int64_t m_vidDTSOut;        // 直前の動画フレームのDTS
     int64_t m_vidFirstFramePTS; // 最初の動画フレームのPTS
-    int64_t m_vidFirstFrameDTS; // 最初の動画フレームのDTS
     int64_t m_vidFirstKeyPTS;   // 最初の動画キーフレームのPTS
     TSRReplaceStartPoint m_startPoint; // 起点モード
-    int64_t m_vidFirstTimestamp;       // 起点のtimestamp
+    int64_t m_vidFirstTimestampOut;    // 起点のtimestamp
     int64_t m_vidFirstPacketPTS;       // 最初のパケットのPTS
     std::vector<uint8_t> m_lastPat; // 直前の出力PATデータ
     std::map<int, std::vector<uint8_t>> m_lastPmts; // PIDごとの直前の出力PMTデータ
@@ -347,6 +386,9 @@ protected:
     bool m_removeNonTargetService; // 非対象serviceの削除
     int m_selectService; // 出力するserviceの番号
     bool m_copyFileTs; // ファイルのタイムスタンプをコピー
+    TSRCutTimeline m_cut; // CM カット用のタイムライン
+    TSRContinuityRewriter m_ccRewriter; // CM カット時の continuity_counter 再構成
+    std::unordered_map<uint16_t, TSRPidCutState> m_pidCutState; // PID ごとの PES 出力状態
     decltype(parse_nal_unit_h264_c) *m_parseNalH264; // H.264用のnal unit分解関数へのポインタ
 
     decltype(parse_nal_unit_hevc_c) *m_parseNalHevc; // HEVC用のnal unit分解関数へのポインタ
@@ -358,13 +400,14 @@ protected:
 
     // 置換遅延関連
     int64_t m_replaceDelay;          // --replace-delay で指定された遅延量(90kHz単位)
-    int64_t m_outputStartTimestamp;  // 出力開始点 = m_firstTimestamp + m_replaceDelay
+    int64_t m_replaceFirstPTS;       // 置換映像の先頭フレームに対応する元TSの絶対PTS (カットリストの先頭トリムから設定)
+    int64_t m_startTimestampSrc;     // 出力開始点 = m_vidFirstPacketPTS + m_replaceDelay
 
     // 置換映像EOF終了関連
     bool    m_endAtReplaceEOF;       // --end-at-replace-eof が有効か
     int     m_eofCutDelayMs;         // EOF からの余裕時間(ms)
-    int64_t m_outputEndTimestamp;    // 出力終了点 (90kHz単位)
-    int64_t m_lastReplaceVidPTS;     // 最後に出力した置換映像のPTS
+    int64_t m_endTimestampOut;       // 出力終了点 (90kHz単位)
+    int64_t m_lastReplaceVidPTSOut;  // 最後に出力した置換映像のPTS
 };
 
 #endif //__TSREPLACE_H__

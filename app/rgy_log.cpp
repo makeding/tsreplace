@@ -493,7 +493,7 @@ void RGYLog::write_log(RGYLogLevel log_level, const RGYLogType logtype, const TC
 #ifdef UNICODE
                 if (!stderr_write_to_console) { //出力先がリダイレクトされるならANSIで
                     buffer_char = wstring_to_string(tchar_to_wstring(line), CP_UTF8);
-                    fprintf(stderr, "%s", buffer_ptr);
+                    fprintf(stderr, "%s", buffer_char.c_str());
                 }
                 if (stderr_write_to_console) //出力先がコンソールならWCHARで
 #endif
@@ -502,7 +502,7 @@ void RGYLog::write_log(RGYLogLevel log_level, const RGYLogType logtype, const TC
         } else {
 #ifdef UNICODE
             if (!stderr_write_to_console) //出力先がリダイレクトされるならANSIで
-                fprintf(stderr, "%s", buffer_ptr);
+                fputs(buffer_ptr, stderr);
             if (stderr_write_to_console) //出力先がコンソールならWCHARで
 #endif
                 rgy_print_stderr(log_level, buffer, hStdErr, m_disableColor);
@@ -569,4 +569,3 @@ void RGYLog::write(RGYLogLevel log_level, const RGYLogType logtype, const TCHAR 
     }
     va_end(args);
 }
-
