@@ -236,8 +236,13 @@ void RGYTSDemuxer::parsePMT(RGYTSDemuxProgram *program) {
     const uint8_t *table = psi->data;
     service.programNumber = (table[3] << 8) | table[4];
     service.pidPcr = ((table[8] & 0x1f) << 8) | table[9];
-    // m_pcr は選択中の対象サービスの時刻を表す。parsePMT() は全サービスに対して
-    // 呼ばれるため、PCR_PID=0x1fff の処理は対象サービス確定後にのみ行う。
+    // m_pcr は PMT ごとの状態ではなく、選択中の対象サービスだけを追跡する共有時計である。
+    // parsePMT() は PAT に載っている全サービスに対して呼ばれるため、ここで無条件に m_pcr を
+    // 変更すると、非対象サービスの PMT が対象サービスの再生・Type-D trim 時刻を壊してしまう。
+    // 特に PCR_PID=0x1fff は「このサービスは PCR PID を持たない」という当該 PMT の宣言であり、
+    // 既に動作中の別サービスの PCR が無効になったことを意味しない。
+    // そのため旧処理は意図が分かる形で残しつつ無効化し、対象 PMT と確認できる parse() 側でのみ
+    // 必要な無効化を行う。
     // if (service.pidPcr == 0x1fff) {
     //     m_pcr = -1;
     // }
@@ -661,8 +666,11 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
             auto pmt_pid = selectServiceID();
             if (pmt_pid && pmt_pid->pmt_pid == program->pmt_pid.pmt_pid) {
                 m_targetService = &program->service;
-                // 対象サービス自身が PCR を持たなくなった場合だけ時刻を無効化する。
-                // 他サービスの PCR_PID=0x1fff で対象サービスの時刻を失ってはならない。
+                // ここは selectServiceID() で選ばれた PMT と、今解析した PMT の PID が一致した後なので、
+                // pidPcr は確実に対象サービス自身の宣言である。対象サービスが PCR_PID=0x1fff に
+                // 変更された場合だけ、以前の PMT から残っている時刻を使い続けないよう無効化する。
+                // 逆に、他サービスの PCR_PID=0x1fff ではこの分岐へ入らないため、対象サービスの
+                // 直近 PCR は保持され、PMT の巡回順序にも Type-D trim の 60 秒判定にも影響しない。
                 if (m_targetService->pidPcr == 0x1fff) {
                     m_pcr = TIMESTAMP_INVALID_VALUE;
                 }
@@ -686,7 +694,15 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
         }
         if (packetHeader.PID == service->service.pidPcr) {
             const auto pcr = parsePCR(packetHeader, pkt->data());
-            if (pcr != TIMESTAMP_INVALID_VALUE) {
+            // result.pcr はこのパケットが属するサービス固有の解析結果として返す一方、m_pcr は
+            // 対象サービスの共有時計として curTimestamp / smart Type-D trim から参照される。
+            // したがって、PCR を持つという理由だけで非対象サービスから m_pcr を更新してはならない。
+            // PID を対象サービスの pidPcr と照合することで、複数サービスの PCR が交互に流れる TS でも
+            // 選択サービスの時間軸だけを単調に追跡する。対象 PMT が未確定の間は時計を進めず、PMT
+            // 確定後に最初の有効 PCR を受け取った時点から追跡を開始する。
+            if (pcr != TIMESTAMP_INVALID_VALUE
+                && m_targetService != nullptr
+                && packetHeader.PID == m_targetService->pidPcr) {
                 m_pcr = pcr;
             }
             result.type = RGYTSPacketType::PCR;

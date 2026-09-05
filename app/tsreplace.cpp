@@ -1192,9 +1192,17 @@ bool TSReplace::shouldRemoveTypeD(int64_t timestamp) const {
         return false;
     }
 
+    // smart trim の時刻原点には、入力映像を事前解析して得た最初のパケット PTS を使う。
+    // 直近の PMT 到着時刻や最初に観測した PCR を原点にすると、PMT 更新・入力開始位置・
+    // PCR の初期位相によって 60 秒の保護区間が前後し、同じ番組でも削除結果が変わってしまう。
+    // timestamp は対象サービスの PTS または PCR で、どちらも 90 kHz の同一時間軸にある。
+    // 上の diffTimestampTsAMinusB() を通すことで 33 bit wrap をまたぐ番組も同じ判定にする。
     const int64_t keepDuration = 60LL * TS_TIMEBASE;
     const int64_t keepInterval = 870LL * TS_TIMEBASE; // 14.5 minutes
+    // 境界上のパケットを欠かさないよう、各 14.5 分区間の先頭 60 秒ちょうどまでは保持する。
     const bool keepPeriodic = (elapsed % keepInterval) <= keepDuration;
+    // 予定尺が明示された場合だけ末尾 60 秒も保護する。未知尺を EOF から逆算しないのは、
+    // stdin や追記中の録画でも未来の入力を待たず、1 pass で決定的に処理するため。
     const bool keepEnd = m_inputDuration > 0
         && elapsed >= std::max<int64_t>(0, m_inputDuration - keepDuration)
         && elapsed <= m_inputDuration;
@@ -2799,6 +2807,26 @@ RGY_ERR TSReplace::restruct() {
                         break;
                     case RGYTSPacketType::OTHER:
                         if (ret.stream.type == RGYTSStreamType::TYPE_D) {
+                            // smart trim の実TS検証用診断ログ。
+                            // 「60秒を過ぎても Type-D が削除されない」場合に、削除判定へ渡した
+                            // 対象サービス時刻と先頭映像PTSからの経過時間を確認できるようにする。
+                            static int smartDebugCount = 0;
+                            const auto smartDebugElapsed = diffTimestampTsAMinusB(curTimestamp, m_vidFirstPacketPTS);
+                            // 通常の全削除モードには影響させず、smart trim のときだけ記録する。
+                            // component_tag=0x40/0x80 のエントリコンポーネントは常時保持対象なので除外し、
+                            // 先頭60秒の保護区間を抜けた非永続PIDだけを診断対象にする。
+                            // 長時間録画で stderr を埋めないよう、1プロセスにつき先頭40パケットで打ち切る。
+                            if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart
+                                && m_smartPersistentTypeDPids.count(tspkt->header.PID) == 0
+                                && smartDebugElapsed >= 60LL * TS_TIMEBASE
+                                && smartDebugCount++ < 40) {
+                                // remove=1 はこのパケットが削除窓内、remove=0 は周期保護窓または
+                                // 予定尺末尾の保護窓内であることを示す。PIDと90kHz時刻も併記し、
+                                // PMT/PCR更新で対象サービス時計が混線していないか同時に追跡する。
+                                fprintf(stderr, "SMART_TYPED pid=0x%04x timestamp=%lld elapsed=%lld remove=%d\n",
+                                    tspkt->header.PID, (long long)curTimestamp,
+                                    (long long)smartDebugElapsed, removeTypeD ? 1 : 0);
+                            }
                             if (shouldDropTypeDPacket(tspkt.get(), removeTypeD)) {
                                 markTypeDPacketRemoved(tspkt.get());
                                 m_removedTypeDPackets++;
