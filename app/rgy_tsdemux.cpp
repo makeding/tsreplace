@@ -236,9 +236,11 @@ void RGYTSDemuxer::parsePMT(RGYTSDemuxProgram *program) {
     const uint8_t *table = psi->data;
     service.programNumber = (table[3] << 8) | table[4];
     service.pidPcr = ((table[8] & 0x1f) << 8) | table[9];
-    if (service.pidPcr == 0x1fff) {
-        m_pcr = -1;
-    }
+    // m_pcr は選択中の対象サービスの時刻を表す。parsePMT() は全サービスに対して
+    // 呼ばれるため、PCR_PID=0x1fff の処理は対象サービス確定後にのみ行う。
+    // if (service.pidPcr == 0x1fff) {
+    //     m_pcr = -1;
+    // }
     const int programInfoLength = ((table[10] & 0x03) << 8) | table[11];
     int pos = 3 + 9 + programInfoLength;
     if (psi->section_length < pos) {
@@ -659,6 +661,11 @@ std::tuple<RGY_ERR, RGYTSDemuxResult> RGYTSDemuxer::parse(const RGYTSPacket *pkt
             auto pmt_pid = selectServiceID();
             if (pmt_pid && pmt_pid->pmt_pid == program->pmt_pid.pmt_pid) {
                 m_targetService = &program->service;
+                // 対象サービス自身が PCR を持たなくなった場合だけ時刻を無効化する。
+                // 他サービスの PCR_PID=0x1fff で対象サービスの時刻を失ってはならない。
+                if (m_targetService->pidPcr == 0x1fff) {
+                    m_pcr = TIMESTAMP_INVALID_VALUE;
+                }
             }
             return { RGY_ERR_NONE, std::move(result) };
         }
