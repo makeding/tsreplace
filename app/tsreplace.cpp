@@ -41,6 +41,7 @@
 #include "rgy_bitstream.h"
 #include "rgy_filesystem.h"
 #include "tsreplace.h"
+#include "rgy_ts_preroll.h"
 
 static const TCHAR *serviceNum[] = {_T(""), _T("1st"), _T("2nd"), _T("3rd"), _T("4th"), _T("5th"), _T("6th"), _T("7th"), _T("8th"), _T("9th")};
 
@@ -192,6 +193,7 @@ TSRReplaceParams::TSRReplaceParams() :
     eofCutDelayMs(100),
     addAud(true),
     addHeaders(true),
+    startupPrerollMs(TSR_STARTUP_PREROLL_DEFAULT_MS),
     removeTypeDMode(TSRRemoveTypeDMode::Disabled),
     smartRemoveTypeDDuration(0),
     removeTypeDExplicitlyDisabled(false),
@@ -1016,6 +1018,11 @@ TSReplace::TSReplace() :
     m_threadOutputTS(),
     m_queueOutput(),
     m_bufferOutput(),
+    m_startupOutput(),
+    m_startupPrerollPending(false),
+    m_startupPrerollMs(TSR_STARTUP_PREROLL_DEFAULT_MS),
+    m_startupPmtPID(0),
+    m_startupPcrPID(0),
     m_outputBlockSize(1 * 1024 * 1024),
     m_outputIsPipe(false),
     m_outputError(RGY_ERR_NONE),
@@ -1130,6 +1137,14 @@ RGY_ERR TSReplace::close() {
         m_encoder.reset();
     }
 
+    // 短い、または不完全なストリームでは準備区間の生成前にEOFへ到達することがある。
+    if (!m_startupOutput.empty()) {
+        m_startupPrerollPending = false;
+        RGYTSPacket initial;
+        initial.packet = std::move(m_startupOutput);
+        if (auto err = writePacket(&initial); err != RGY_ERR_NONE && sts == RGY_ERR_NONE) sts = err;
+    }
+
     // 出力スレッドの終了処理: 残りのバッファをフラッシュしてEOFを通知し、書き込み完了を待ってからファイルを閉じる
     if (m_threadOutputTS) {
         AddMessage(RGY_LOG_DEBUG, _T("Flush output buffer.\n"));
@@ -1218,6 +1233,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     m_replaceDelay = prms.replaceDelay;
     m_addAud = prms.addAud;
     m_addHeaders = prms.addHeaders;
+    m_startupPrerollMs = prms.startupPrerollMs;
     m_removeTypeDMode = prms.removeTypeDMode;
     m_trimOnly = prms.replacefile.empty() && prms.encoderPath.empty();
     m_selectService = prms.selectService;
@@ -1299,6 +1315,7 @@ RGY_ERR TSReplace::init(std::shared_ptr<RGYLog> log, const TSRReplaceParams& prm
     }
     AddMessage(RGY_LOG_INFO, _T("Preserve Other Services: %s.\n"), m_removeNonTargetService ? _T("off") : _T("on"));
     AddMessage(RGY_LOG_INFO, _T("Copy File Timestamp: %s.\n"), m_copyFileTs ? _T("on") : _T("off"));
+    AddMessage(RGY_LOG_INFO, _T("Preroll: %d ms.\n"), m_startupPrerollMs);
 
     if (m_removeTypeDMode == TSRRemoveTypeDMode::Smart) {
         AddMessage(RGY_LOG_INFO, _T("Smart Type-D keep schedule: keep 60 sec every 870 sec until EOF.\n"));
@@ -1565,6 +1582,22 @@ RGY_ERR TSReplace::flushOutputBuffer() {
 }
 
 RGY_ERR TSReplace::writePacket(RGYTSPacket *pkt) {
+    if (m_startupPrerollPending) {
+        m_startupOutput.insert(m_startupOutput.end(), pkt->data(), pkt->data() + pkt->datasize());
+        auto preroll = tsrMakeStartupPreroll(m_startupOutput, m_startupPmtPID, m_startupPcrPID, m_startupPrerollMs);
+        // 完全なPSI/PCRがない場合はバッファ量に上限を設け、保持した出力を欠落させずに書き出す。
+        if (preroll.empty() && m_startupOutput.size() < 1024 * 1024) return RGY_ERR_NONE;
+        m_startupPrerollPending = false;
+        RGYTSPacket initial;
+        initial.packet = std::move(m_startupOutput);
+        if (!preroll.empty()) {
+            RGYTSPacket lead;
+            lead.packet = std::move(preroll);
+            AddMessage(RGY_LOG_INFO, _T("Add %d ms startup PSI/PCR preroll with early table delivery.\n"), ((m_startupPrerollMs + 19) / 20) * 20);
+            if (auto err = writePacket(&lead); err != RGY_ERR_NONE) return err;
+        }
+        return writePacket(&initial);
+    }
     if (cutMode()) {
         // CC は出力直前だけ書き換え、呼び出し元で packet を再利用しないため、buffer を直接更新する。
         auto *data = pkt->packet.data();
@@ -1720,9 +1753,9 @@ RGY_ERR TSReplace::finalizeHeldADTSPES(uint16_t pid, TSRPidCutState& state, bool
     return err;
 }
 
-RGY_ERR TSReplace::flushHeldADTSPES() {
+RGY_ERR TSReplace::flushHeldADTSPES(bool truncateTail) {
     for (auto& [pid, state] : m_pidCutState) {
-        if (auto err = finalizeHeldADTSPES(pid, state, false); err != RGY_ERR_NONE) {
+        if (auto err = finalizeHeldADTSPES(pid, state, truncateTail); err != RGY_ERR_NONE) {
             return err;
         }
     }
@@ -2102,6 +2135,8 @@ RGY_ERR TSReplace::writeReplacedVideo(AVPacket *avpkt) {
     // 置換映像のtimecodeはカット済みの出力時間軸なので、mapToOutput()を適用すると二重にカットされる。
     const auto pts = av_rescale_q(avpkt->pts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestampOut;
     const auto dts = av_rescale_q(avpkt->dts - m_videoReplace->getFirstKeyPts(), m_videoReplace->getVidTimebase(), av_make_q(1, TS_TIMEBASE)) + m_vidFirstTimestampOut;
+
+    // 末尾境界以降の参照フレームも、境界前のBフレームの復号に必要なためPTSでは除外しない。
 
     // 最後に出力した置換映像のPTSを記録 (EOF時の終了しきい値計算用)
     m_lastReplaceVidPTSOut = pts;
@@ -2579,6 +2614,12 @@ RGY_ERR TSReplace::restruct() {
         }
     }
 
+    // TVTestではコーデック変更時にデコーダの初期化が非同期で行われる。
+    // PTS/DTSを移動せず、先頭のアクセス単位より前に時計付きのテーブルを送る。
+    m_startupPrerollPending = m_startupPrerollMs > 0;
+    m_startupPmtPID = m_demuxer->selectServiceID()->pmt_pid;
+    m_startupPcrPID = m_pcrPIDReplace ? m_pcrPIDReplace : m_demuxer->service()->pidPcr;
+
     const RGYTS_PAT *pat = nullptr;
     const RGYService *service = nullptr;
     int64_t m_pcr = TIMESTAMP_INVALID_VALUE;
@@ -2591,6 +2632,8 @@ RGY_ERR TSReplace::restruct() {
     auto outputState = (!m_trimOnly && trimHead() && m_startTimestampSrc != TIMESTAMP_INVALID_VALUE) ? TSROutputState::Cutting : TSROutputState::Output;
     bool replaceDelayOutputAudioStarted = false; // m_replaceDelay > 0の場合に、音声出力を開始したかどうかのフラグ
     bool warnedADTSAudioPCR = false;
+    bool tailTrimReached = false;
+    std::vector<uint16_t> tailAudioPIDs;
 
     //本解析
     for (;;) {
@@ -2598,7 +2641,7 @@ RGY_ERR TSReplace::restruct() {
             auto err = readTS(tsPackets);
             if (err != RGY_ERR_NONE) {
                 if (err == RGY_ERR_MORE_DATA) {
-                    if (auto flushErr = flushHeldADTSPES(); flushErr != RGY_ERR_NONE) {
+                    if (auto flushErr = flushHeldADTSPES(tailTrimPTS() != TIMESTAMP_INVALID_VALUE); flushErr != RGY_ERR_NONE) {
                         return flushErr;
                     }
                 }
@@ -2607,7 +2650,13 @@ RGY_ERR TSReplace::restruct() {
         }
 
         for (auto& tspkt : tsPackets) {
-            if (!m_trimOnly && outputState == TSROutputState::Output && pat) {
+            // 多重化順序による遅れを考慮し、各音声PIDの境界PESまで読み進める。
+            // PMTにだけ存在する音声PIDやPTSのない音声は、入力EOFまで待つ。
+            if (tailTrimReached && std::all_of(tailAudioPIDs.begin(), tailAudioPIDs.end(),
+                [this](uint16_t pid) { return m_pidCutState[pid].tailTrimReached; })) {
+                return RGY_ERR_NONE;
+            }
+            if (!m_trimOnly && !tailTrimReached && outputState == TSROutputState::Output && pat) {
                 if (tspkt->header.PID == 0x00) { //PAT
                     if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                         return err;
@@ -2634,23 +2683,42 @@ RGY_ERR TSReplace::restruct() {
             }
             const bool removeTypeD = shouldRemoveTypeD(curTimestamp);
 
-            // 末尾トリム: 元TS上の絶対PTSで直接判定する (置換映像のEOFに依存しない)
-            if (outputState == TSROutputState::Output
+            // 末尾トリム位置で映像を確定しても、後方の音声PESはまだ読み終えていない。
+            if (!tailTrimReached && outputState == TSROutputState::Output
                 && tailTrimPTS() != TIMESTAMP_INVALID_VALUE
                 && curTimestamp != TIMESTAMP_INVALID_VALUE
                 && diffTimestampTsAMinusB(curTimestamp, tailTrimPTS()) >= 0) {
-                AddMessage(RGY_LOG_DEBUG, _T("Stop output at timestamp %11lld (>= tail trim %11lld).\n"),
-                    (long long)curTimestamp, (long long)tailTrimPTS());
-                // curTimestampは音声など映像以外のPESでも更新されるため、この時点では置換映像の
-                // 書き出しが末尾トリム位置まで届いていないことがある。末尾まで書き切ってから終了する。
+                AddMessage(RGY_LOG_DEBUG, _T("Reached tail trim %11lld; draining audio PES.\n"),
+                    (long long)tailTrimPTS());
+                tailTrimReached = true;
+                if (const auto targetService = m_demuxer->service(); targetService != nullptr) {
+                    for (const auto pid : { targetService->aud0.stream.pid, targetService->aud1.stream.pid }) {
+                        if (pid > 0) tailAudioPIDs.push_back((uint16_t)pid);
+                    }
+                }
                 m_vidDTSOutMax = mapToOutput(tailTrimPTS());
                 if (auto err = writeReplacedVideo(); (err != RGY_ERR_NONE && err != RGY_ERR_MORE_DATA)) {
                     return err;
                 }
-                if (auto err = flushHeldADTSPES(); err != RGY_ERR_NONE) {
-                    return err;
+            }
+            if (tailTrimReached) {
+                // 音声以外はこれ以上出力せず、映像の出力時計も進めない。
+                const auto pid = tspkt->header.PID;
+                if (std::find(tailAudioPIDs.begin(), tailAudioPIDs.end(), pid) == tailAudioPIDs.end()
+                    || m_pidCutState[pid].tailTrimReached) {
+                    continue;
                 }
-                return RGY_ERR_NONE;
+                if (tspkt->header.PayloadStartFlag && ret.pts != TIMESTAMP_INVALID_VALUE
+                    && diffTimestampTsAMinusB(ret.pts, tailTrimPTS()) >= 0) {
+                    auto& state = m_pidCutState[pid];
+                    // 境界以降のPESは出力せず、直前のPESを完全なAACフレームで閉じる。
+                    if (auto err = finalizeHeldADTSPES(pid, state, true); err != RGY_ERR_NONE) {
+                        return err;
+                    }
+                    state.keepPES = false;
+                    state.tailTrimReached = true;
+                    continue;
+                }
             }
 
             // 映像EOF+マージンを超えたら出力を打ち切る (PTS wrap を考慮)
@@ -2990,6 +3058,8 @@ static void show_help() {
 
         _T("   --(no-)add-aud               auto insert aud unit\n")
         _T("   --(no-)add-headers           auto insert headers\n")
+        _T("   --startup-preroll <int>      MPEG-2/H.264/HEVC startup lead-in in ms (default 0)\n")
+        _T("                                 0 disables; 1-60000 rounded up to 20 ms\n")
         _T("   --(no-)remove-typed          remove type-d packets from the entire stream\n")
         _T("   --smart-remove-typed         keep type-d for 60 sec every 14.5 minutes\n")
         _T("   --smart-remove-typed-duration <seconds>\n")
@@ -3190,6 +3260,24 @@ int ParseOneOption(const TCHAR *option_name, const TCHAR **strInput, int& i, con
     }
     if (IS_OPTION("no-add-aud")) {
         prm.addAud = false;
+        return 0;
+    }
+    if (IS_OPTION("startup-preroll")) {
+        if (i + 1 >= argc || strInput[i + 1] == nullptr) {
+            _ftprintf(stderr, _T("Missing value for --%s\n"), option_name);
+            return 1;
+        }
+        i++;
+        try {
+            size_t consumed = 0;
+            prm.startupPrerollMs = std::stoi(strInput[i], &consumed);
+            if (consumed != _tcslen(strInput[i]) || prm.startupPrerollMs < 0 || prm.startupPrerollMs > 60000) {
+                throw std::invalid_argument("Invalid startup preroll");
+            }
+        } catch (...) {
+            _ftprintf(stderr, _T("Invalid value for --%s: \"%s\" (expected 0-60000 ms)\n"), option_name, strInput[i]);
+            return 1;
+        }
         return 0;
     }
     if (IS_OPTION("add-headers")) {

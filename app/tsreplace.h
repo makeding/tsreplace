@@ -219,6 +219,7 @@ struct TSRReplaceParams {
     std::vector<tstring> encoderArgs;
     bool addAud;
     bool addHeaders;
+    int startupPrerollMs;
     TSRRemoveTypeDMode removeTypeDMode;
     int64_t smartRemoveTypeDDuration;
     bool removeTypeDExplicitlyDisabled;
@@ -233,6 +234,7 @@ struct TSRReplaceParams {
 struct TSRPidCutState {
     bool keepPES = false;
     bool seenPUSI = false;
+    bool tailTrimReached = false; // このPIDで末尾トリム以降のPESを確認したか。
     // 音声は次の PUSI で cut 境界が確定するため、1 PES だけ出力を保留する。
     std::vector<std::vector<uint8_t>> heldPackets;
     std::vector<uint8_t> heldPESData;
@@ -272,7 +274,7 @@ protected:
     bool shouldDropTypeDPacket(const RGYTSPacket *pkt, bool removeTypeD);
     void markTypeDPacketRemoved(const RGYTSPacket *pkt);
     RGY_ERR finalizeHeldADTSPES(uint16_t pid, TSRPidCutState& state, bool truncateTail);
-    RGY_ERR flushHeldADTSPES();
+    RGY_ERR flushHeldADTSPES(bool truncateTail = false);
     RGY_ERR writeReplacedPCR(const uint64_t pcr);
     RGY_ERR writeReplacedPAT(const RGYTS_PAT *pat);
     RGY_ERR writeReplacedPMT(const RGYTSDemuxResult& result, int pmtPid, bool removeTypeD, bool replaceVideo);
@@ -341,6 +343,11 @@ protected:
     std::unique_ptr<std::thread> m_threadOutputTS; // ファイル出力用の書き込みスレッド
     std::unique_ptr<RGYQueueBuffer> m_queueOutput; // ファイル出力用の書き込みキュー
     std::vector<uint8_t> m_bufferOutput; // 出力TSをブロック単位にまとめるバッファ
+    std::vector<uint8_t> m_startupOutput; // PSI/PCRが揃うまでの先頭出力(最大1MiB)
+    bool m_startupPrerollPending;
+    int m_startupPrerollMs;
+    uint16_t m_startupPmtPID;
+    uint16_t m_startupPcrPID;
     size_t m_outputBlockSize; // ファイル出力をまとめる単位
     bool m_outputIsPipe; // 出力先が標準出力かどうか
     std::atomic<RGY_ERR> m_outputError; // 出力スレッドで発生したエラー

@@ -763,7 +763,8 @@ RGYTSPacketSplitter::RGYTSPacketSplitter() :
     m_log(),
     m_readBuf(),
     m_packetContainer(),
-    m_packetSize(0) {
+    m_packetSize(0),
+    m_synced(false) {
 
 }
 
@@ -846,8 +847,13 @@ std::tuple<RGY_ERR, std::vector<uniqueRGYTSPacket>> RGYTSPacketSplitter::split(v
 
     m_readBuf.addData(ptr, addSize);
 
-    while (m_packetSize == 0 || (int)m_readBuf.size() >= m_packetSize) {
-        auto offset = findsync(m_readBuf.data(), (int)m_readBuf.size(), &m_packetSize);
+    while ((int)m_readBuf.size() >= (m_packetSize ? m_packetSize : 188)) {
+        // 同期が続く間は次のパケット先頭だけを確認し、外れた場合に再検索する。
+        int offset = 0;
+        if (!m_synced || m_readBuf.data()[0] != TS_SYNC_BYTE) {
+            m_synced = false;
+            offset = findsync(m_readBuf.data(), (int)m_readBuf.size(), &m_packetSize);
+        }
         if (offset < 0) {
             // 見つからなかった場合、読み飛ばしてその先から見つけなおす
             int step = m_packetSize ? m_packetSize : 188;
@@ -855,7 +861,9 @@ std::tuple<RGY_ERR, std::vector<uniqueRGYTSPacket>> RGYTSPacketSplitter::split(v
                 offset = findsync(m_readBuf.data() + dataoffset, (int)m_readBuf.size() - dataoffset, &m_packetSize);
                 if (offset >= 0) {
                     offset += dataoffset;
-                    m_log->write(RGY_LOG_WARN, RGY_LOGT_IN, _T("Skip %d byte, data might be corrupted.\n"), offset);
+                    if (m_log) {
+                        m_log->write(RGY_LOG_WARN, RGY_LOGT_IN, _T("Skip %d byte, data might be corrupted.\n"), offset);
+                    }
                     break;
                 }
                 step = m_packetSize ? m_packetSize : 188;
@@ -864,17 +872,21 @@ std::tuple<RGY_ERR, std::vector<uniqueRGYTSPacket>> RGYTSPacketSplitter::split(v
         if (offset < 0) {
             return { RGY_ERR_NONE, std::move(packets) };
         }
-        const auto bytesToConsume = (size_t)offset + m_packetSize;
-        if (m_readBuf.size() < bytesToConsume) {
-            // A sync byte was found near the end of the current chunk, but the
-            // complete packet has not arrived yet.
+
+        // 再同期で読み飛ばした分も消費し、末尾の不完全なパケットは次回へ残す。
+        if (offset > 0) {
+            m_readBuf.removeData(offset);
+        }
+        if ((int)m_readBuf.size() < m_packetSize) {
             return { RGY_ERR_NONE, std::move(packets) };
         }
+        m_synced = true;
 
         auto pkt = m_packetContainer.getEmpty();
+        // Normalize 192/204-byte input units to the 188-byte TS output contract.
         pkt->packet.resize(188);
-        memcpy(pkt->packet.data(), m_readBuf.data() + offset, pkt->packet.size());
-        m_readBuf.removeData(bytesToConsume);
+        memcpy(pkt->packet.data(), m_readBuf.data(), pkt->packet.size());
+        m_readBuf.removeData(m_packetSize);
 
         pkt->header = parsePacketHeader(pkt->packet.data(), m_readBuf.pos());
         if (pkt->header.Sync != TS_SYNC_BYTE) {
